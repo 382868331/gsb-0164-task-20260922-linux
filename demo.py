@@ -7,10 +7,12 @@ from collections import Counter
 from ftl import (
     FTL,
     PAGE_SIZE,
+    GCBudgetExhaustedError,
     InvalidInputError,
     OutOfSpaceError,
     PowerLossError,
     RawNand,
+    TransactionError,
     require_finite_number,
 )
 from ftl.errors import BlockWornError
@@ -110,7 +112,127 @@ def part_boundary():
             print(f"  非法输入被拒绝 [{label}]: {e}")
 
 
+def part_transaction():
+    print("=== 第三部分（本次迭代）：最多 4 页的原子事务 ===")
+    items = [(i, f"NEW-{i}".encode()) for i in range(4)]
+
+    # --- 正常路径：暂存不可见 → 单记录原子提交 → 重挂载持久 ---
+    dev = RawNand(max_erases=8)
+    ftl = FTL(dev)
+    for i in range(4):
+        ftl.write(i, f"old-{i}".encode())
+    n0 = len(dev.action_log())
+    ftl.begin_transaction()
+    for lpn, data in items:
+        ftl.txn_put(lpn, data)
+    hidden = all(ftl.read(i) == f"old-{i}".encode().ljust(PAGE_SIZE, b"\xff") for i in range(4))
+    print(f"  暂存 4 页后、提交前：read 仍全部返回旧值（暂存不可见）= {hidden}")
+    seq = ftl.commit_transaction()
+    acts = [a.purpose for a in dev.action_log()[n0:]]
+    visible = all(ftl.read(i) == items[i][1].ljust(PAGE_SIZE, b"\xff") for i in range(4))
+    print(f"  提交后 4 页整笔可见 = {visible}；物理动作 = {acts}（4 数据页 + 恰好 1 条提交记录）")
+    print(f"  序列号只前进 1 次：commit_seq={seq}")
+    ftl2 = FTL(dev)
+    persisted = all(ftl2.read(i) == items[i][1].ljust(PAGE_SIZE, b"\xff") for i in range(4))
+    print(f"  重新挂载后整笔新映像持久保留 = {persisted}")
+
+    # --- 原子性实证：逐物理动作注入掉电（真实枚举，非预录） ---
+    print("  -- 掉电原子性枚举：覆盖 4 个已映射页的事务，共 5 个物理动作 --")
+    dev = RawNand(max_erases=8)
+    ftl = FTL(dev)
+    for i in range(4):
+        ftl.write(i, f"old-{i}".encode())
+    snap_pre = dev.snapshot()
+    base = len(dev.action_log())
+    ftl.transaction_put(items)
+    total = len(dev.action_log()) - base
+    old_img = {i: f"old-{i}".encode().ljust(PAGE_SIZE, b"\xff") for i in range(4)}
+    new_img = {i: items[i][1].ljust(PAGE_SIZE, b"\xff") for i in range(4)}
+    verdict = {}
+    for k in range(1, total + 1):  # 在第 k 个动作后掉电
+        dev.restore(snap_pre)
+        dev.set_crash_plan([k])
+        dev.arm_crash()
+        f = FTL(dev)
+        f.begin_transaction()
+        for lpn, data in items:
+            f.txn_put(lpn, data)
+        try:
+            f.commit_transaction()
+        except PowerLossError:
+            pass
+        dev.reboot()
+        r = FTL(dev)
+        got = {i: r.read(i) for i in range(4)}
+        verdict[k] = "整笔新值" if got == new_img else ("整笔旧值" if got == old_img else "混合(错误!)")
+    for k, v in verdict.items():
+        print(f"    第 {k} 个物理动作后掉电 → 恢复映像：{v}")
+    ok_atomic = set(verdict.values()) <= {"整笔旧值", "整笔新值"} and verdict[total] == "整笔新值"
+    print(f"  5 个断电点只出现整旧/整新，且提交动作后为整笔新值：{ok_atomic}")
+
+    # --- 边界与实际错误：容量必须先拒绝 ---
+    print("  -- 容量边界：填满至 GC 保留线，预算为 0 时事务必须先拒绝 --")
+    dev = RawNand(max_erases=8)
+    ftl = FTL(dev, gc_budget=0)
+    i = 0
+    while ftl.capacity()["free_physical_pages"] > 8:
+        ftl.write(i % 24, bytes([i % 256]) * 8)
+        i += 1
+    cap = ftl.capacity()
+    print(f"  填充后：空白页={cap['free_physical_pages']}（4 数据+1 提交需 13）"
+          f"，可回收死页={cap['reclaimable_dead_pages']}")
+    before = len(dev.action_log())
+    shadow = {l: ftl.read(l) for l in range(24)}
+    try:
+        ftl.transaction_put(items)
+        print("  错误：容量不足的事务应被拒绝")
+    except GCBudgetExhaustedError as e:
+        print(f"  捕获 GCBudgetExhaustedError: {e}")
+    wrote_txn_page = any(a.purpose == "txn-data" for a in dev.action_log()[before:])
+    unchanged = all(ftl.read(l) == shadow[l] for l in range(24))
+    print(f"  拒绝后：无任何 txn-data 物理页={not wrote_txn_page}，映像逐页不变={unchanged}，"
+          f"无残留事务={not ftl.in_transaction()}")
+    seq_after = ftl.transaction_put(items, gc_budget=8)
+    ok = all(ftl.read(i) == new_img[i] for i in range(4))
+    print(f"  同一事务放宽预算至 8 后提交成功（seq={seq_after}），4 页新值可读 = {ok}")
+
+    # --- 输入与状态机错误 ---
+    print("  -- 非法输入与事务状态机错误（每个用例独立设备）--")
+    cases = [
+        ("第 5 个不同逻辑页", _fifth_page),
+        ("未 begin 就 commit", lambda f: f.commit_transaction()),
+        ("事务进行中调用 write", _write_inside),
+    ]
+    for label, make_call in cases:
+        f = FTL(RawNand(max_erases=4))
+        try:
+            make_call(f)
+            print(f"  错误：{label} 应被拒绝")
+        except (InvalidInputError, TransactionError) as e:
+            print(f"  捕获 {type(e).__name__} [{label}]: {e}")
+    f = FTL(RawNand(max_erases=4))
+    f.begin_transaction()
+    f.txn_put(0, b"will-abort")
+    n_phys = len(f.physical_log())
+    f.abort_transaction()
+    print(f"  abort 丢弃暂存且零物理写入 = {len(f.physical_log()) == n_phys}，"
+          f"read(0) 未映射 = {f.read(0) is None}")
+
+
+def _fifth_page(ftl):
+    ftl.begin_transaction()
+    for i in range(5):
+        ftl.txn_put(i, b"x")
+
+
+def _write_inside(ftl):
+    ftl.begin_transaction()
+    ftl.txn_put(0, b"x")
+    ftl.write(1, b"y")
+
+
 if __name__ == "__main__":
     part_normal()
     part_boundary()
+    part_transaction()
     print("演示结束。")

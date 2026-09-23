@@ -28,11 +28,13 @@ from .errors import (
     InvalidInputError,
     OutOfSpaceError,
     PowerLossError,
+    TransactionError,
 )
 from .validation import INT_CAP, require_bytes, require_int
 
 LOGICAL_PAGES = 24
 GC_RESERVE_PAGES = PAGES_PER_BLOCK  # 为用户分配保留 1 块，保障 GC 搬迁有处可去
+TRANSACTION_MAX_PAGES = 4  # 单笔原子事务最多覆盖的不同逻辑页数
 _UNMAPPED = 0xFF
 _COMMIT_MAGIC = 0xA5
 _SEQ_MAX = 0xFFFFFF  # 24 位序列号空间
@@ -115,6 +117,10 @@ class FTL:
         self._pinned: set[int] = set()
         self._view = [_BlockView() for _ in range(BLOCKS)]
         self._gc_spent = 0
+        # 事务状态：None 表示无进行中事务；否则为 {lpn: data} 的暂存区。
+        # 暂存只存在于内存——断电时随主机内存丢失，闪存上不会留下事务痕迹，
+        # 因此恢复后必然无进行中事务。
+        self._txn: dict[int, bytes] | None = None
         self._mount()
 
     # ------------------------------------------------------------------
@@ -156,12 +162,15 @@ class FTL:
                 ppn = b * PAGES_PER_BLOCK + p
                 if ppn in self._pinned:
                     v.pinned += 1
-                elif dev.is_blank(b, p):
-                    v.blanks += 1
+                elif ppn in valid:
+                    # 映射引用的页恒为有效页：全 0xFF 的数据页与空白页
+                    # 物理上不可区分，必须以映射（元数据）为准，否则会被
+                    # 误当空白页重复分配（已知陷阱，见 README 设计取舍）
+                    v.valid += 1
                 elif ppn == self._commit_ppn:
                     v.commit += 1
-                elif ppn in valid:
-                    v.valid += 1
+                elif dev.is_blank(b, p):
+                    v.blanks += 1
                 else:
                     v.dead += 1
         self._view = views
@@ -176,9 +185,14 @@ class FTL:
         """覆盖写逻辑页：新数据页 + 提交记录。失败不改变已提交逻辑映像。
 
         物理层可能留下未提交的孤儿页（属已说明的部分变更，GC 会回收）。
+        事务进行中禁止调用本方法（请用事务接口或先 abort_transaction）。
         """
         lpn = require_int("lpn", lpn, 0, LOGICAL_PAGES - 1)
         data = require_bytes("data", data, min_len=1, max_len=PAGE_SIZE)
+        if self._txn is not None:
+            raise TransactionError(
+                "事务进行中不能调用 write()：请先 commit_transaction/abort_transaction"
+            )
         budget = self._resolve_budget(gc_budget)
         self._gc_spent = 0
         self._rebuild_view()
@@ -214,9 +228,173 @@ class FTL:
         )
         return data
 
+    # ------------------------------------------------------------------
+    # 公开逻辑接口：原子事务（最多 TRANSACTION_MAX_PAGES 个不同逻辑页）
+    # ------------------------------------------------------------------
+    def begin_transaction(self):
+        """开启一笔事务：之后用 txn_put 暂存（内存），commit 原子生效或 abort 丢弃。
+
+        事务进行中禁止 write()/gc_collect()；暂存只在内存，断电随主机丢失。
+        """
+        if self._txn is not None:
+            raise TransactionError("已有事务进行中：不支持嵌套事务")
+        self._txn = {}
+        self._logical_log.append({"op": "txn-begin"})
+
+    def txn_put(self, lpn, data):
+        """向当前事务暂存一页（覆盖本事务内对同一 lpn 的先前暂存）。
+
+        暂存不产生任何物理写入；一笔事务最多包含 4 个不同 lpn。
+        """
+        lpn = require_int("lpn", lpn, 0, LOGICAL_PAGES - 1)
+        data = require_bytes("data", data, min_len=1, max_len=PAGE_SIZE)
+        if self._txn is None:
+            raise TransactionError("txn_put() 前必须先 begin_transaction()")
+        if lpn not in self._txn and len(self._txn) >= TRANSACTION_MAX_PAGES:
+            raise InvalidInputError(
+                f"单笔事务最多 {TRANSACTION_MAX_PAGES} 个不同逻辑页，"
+                f"当前已有 {len(self._txn)} 个"
+            )
+        self._txn[lpn] = data
+        self._logical_log.append(
+            {"op": "txn-put", "lpn": lpn, "size": len(data), "pages": len(self._txn)}
+        )
+
+    def transaction_put(self, items, *, gc_budget=None):
+        """便捷原子接口：items 为 (lpn, data) 序列，内部 begin/puts/commit。
+
+        返回提交后的提交序列号；任何输入非法或容量不足都整体不生效。
+        要求不存在进行中的事务。
+        """
+        if self._txn is not None:
+            raise TransactionError(
+                "已有事务进行中：transaction_put 不能与显式事务嵌套"
+            )
+        # 先完整复制并校验，任何非法项都不得留下进行中事务
+        pairs = []
+        seen = set()
+        try:
+            iterator = iter(items)
+        except TypeError:
+            raise InvalidInputError(
+                f"items 必须是 (lpn, data) 序列，得到 {items!r}"
+            ) from None
+        for idx, item in enumerate(iterator):
+            try:
+                lpn_raw, data_raw = item
+            except (TypeError, ValueError):
+                raise InvalidInputError(
+                    f"items[{idx}] 必须是 (lpn, data) 二元组，得到 {item!r}"
+                ) from None
+            lpn = require_int(f"items[{idx}] 的 lpn", lpn_raw, 0, LOGICAL_PAGES - 1)
+            data = require_bytes(
+                f"items[{idx}] 的 data", data_raw, min_len=1, max_len=PAGE_SIZE
+            )
+            pairs.append((lpn, data))
+            seen.add(lpn)
+        if len(seen) > TRANSACTION_MAX_PAGES:
+            raise InvalidInputError(
+                f"单笔事务最多 {TRANSACTION_MAX_PAGES} 个不同逻辑页，"
+                f"得到 {len(seen)} 个"
+            )
+        self.begin_transaction()
+        try:
+            for lpn, data in pairs:
+                self.txn_put(lpn, data)
+            seq = self.commit_transaction(gc_budget=gc_budget)
+        except BaseException:
+            # 提交期掉电时设备冻结、内存事务清空；其它异常一律回滚暂存
+            self._txn = None
+            raise
+        return seq
+
+    def commit_transaction(self, *, gc_budget=None):
+        """原子提交当前事务，返回提交后的序列号。
+
+        顺序保证原子性：先做容量决策（必要时 GC，全部旧映像仍受既有提交
+        记录保护），再顺序写 n 个 txn-data 页，最后用唯一一条 txn-commit
+        记录一次性公开全部新映射。提交记录落盘前掉电 → 恢复得整笔旧值；
+        落盘后掉电 → 恢复得整笔新值；不存在中间态。
+
+        容量/预算不足在写任何事务数据页之前拒绝（InvalidInputError 的空
+        事务同样先拒绝），不产生任何事务页；GC 动作可能已经发生，但它们
+        只回收死页、不改变已提交映像。提交因任何原因失败时，内存暂存
+        一律清空（不留半更新状态）；需要重试请重新 begin/put。
+        """
+        if self._txn is None:
+            raise TransactionError("没有进行中的事务可提交")
+        staging = self._txn
+        if not staging:
+            self._txn = None
+            raise InvalidInputError("空事务不能提交：至少需要 txn_put 一页")
+        budget = self._resolve_budget(gc_budget)
+        n = len(staging)
+        self._gc_spent = 0
+        self._rebuild_view()
+        updates: dict[int, int] = {}
+        lpns = sorted(staging)
+        try:
+            # 阶段 1（决策/整理）：在写任何事务数据页之前，保证空白页足够
+            # n 个数据页 + 1 个提交页。此阶段失败：提交映像不变，直接拒绝。
+            self._reserve_pages(n + 1, budget)
+            # 阶段 2：顺序写 n 个数据页（尚无提交记录引用它们 → 对恢复不可见）。
+            # 这些页必须全程 pin 到提交记录落盘：全 0xFF 数据页与空白页不可
+            # 区分，否则同一事务后续分配可能重复占用本事务早先的数据页。
+            for lpn in lpns:
+                ppn = self._alloc_page(set())
+                # _reserve_pages 已保证有足够空白页（且未向设备写入），
+                # 分配必成功；防御性检查：
+                if ppn is None:
+                    raise FTLError("内部错误：预留后仍无法分配事务数据页")
+                self._pinned.add(ppn)
+                self._program(ppn, staging[lpn], purpose="txn-data")
+                updates[lpn] = ppn
+            # 阶段 3：唯一一条提交记录原子公开全部新映射
+            self._commit_mapping(
+                updates, set(), 0, budget, GC_RESERVE_PAGES, purpose="txn-commit"
+            )
+        except (BadBlockError, BlockWornError):
+            self._rebuild_view()
+            self._txn = None
+            raise
+        except BaseException:
+            # PowerLossError/容量拒绝等：清空内存暂存；已提交映像语义由恢复保证
+            self._txn = None
+            raise
+        finally:
+            # 事务数据页从分配到提交记录落盘全程 pin；无论成功失败都释放
+            self._pinned.difference_update(updates.values())
+        self._txn = None
+        self._logical_log.append(
+            {"op": "txn-commit", "pages": n, "seq": self._seq}
+        )
+        return self._seq
+
+    def abort_transaction(self):
+        """丢弃当前事务的全部暂存（纯内存操作，无物理写入）。幂等于无事务时抛状态错误。"""
+        if self._txn is None:
+            raise TransactionError("没有进行中的事务可搁置")
+        n = len(self._txn)
+        self._txn = None
+        self._logical_log.append({"op": "txn-abort", "pages": n})
+
+    def in_transaction(self):
+        """是否存在进行中的事务（暂存尚未提交/搁置）。"""
+        return self._txn is not None
+
+    def transaction_staging(self):
+        """当前事务暂存区只读副本：((lpn, data), ...)，按 lpn 排序；无事务返回 ()。"""
+        if self._txn is None:
+            return ()
+        return tuple((lpn, self._txn[lpn]) for lpn in sorted(self._txn))
+
     def gc_collect(self, *, gc_budget=None):
         """手动垃圾整理：在预算内回收所有可回收块，返回成功擦除的块数。"""
         budget = self._resolve_budget(gc_budget)
+        if self._txn is not None:
+            raise TransactionError(
+                "事务进行中不能调用 gc_collect()：请先 commit_transaction/abort_transaction"
+            )
         self._gc_spent = 0
         self._rebuild_view()
         reclaimed = 0
@@ -244,6 +422,9 @@ class FTL:
             ),
             "erase_counts": tuple(dev.erase_count(b) for b in range(BLOCKS)),
             "commit_seq": self._seq,
+            "transaction_open": self._txn is not None,
+            "transaction_staged_pages": 0 if self._txn is None else len(self._txn),
+            "transaction_max_pages": TRANSACTION_MAX_PAGES,
         }
 
     def logical_log(self):
@@ -281,8 +462,16 @@ class FTL:
         self._rebuild_view()
 
     def _alloc_page(self, exclude):
-        """选（擦除次数最少, 空白页最多, 块号最小）的块，取其首个空白页。"""
+        """选（擦除次数最少, 空白页最多, 块号最小）的块，取其首个可写页。
+
+        可写判定不信赖物理 blank 位：映射引用页（即使内容恰为全 0xFF）、
+        pinned 页（进行中的写入/搬迁/事务数据页）、当前提交记录页一律跳过。
+        """
         dev = self._dev
+        referenced = {p for p in self._mapping if p != _UNMAPPED}
+        referenced.update(self._pinned)
+        if self._commit_ppn is not None:
+            referenced.add(self._commit_ppn)
         candidates = []
         for b in range(BLOCKS):
             if b in exclude or dev.is_bad_block(b):
@@ -294,8 +483,11 @@ class FTL:
         candidates.sort()
         for _, b in candidates:
             for p in range(PAGES_PER_BLOCK):
+                ppn = b * PAGES_PER_BLOCK + p
+                if ppn in referenced:
+                    continue
                 if dev.is_blank(b, p):
-                    return b * PAGES_PER_BLOCK + p
+                    return ppn
         return None
 
     def _ensure_free_page(self, exclude, depth, budget, reserve):
@@ -312,6 +504,21 @@ class FTL:
                 raise FTLError("垃圾整理嵌套深度异常，判定为内部状态错误")
             self._reclaim_one_block(exclude, depth, budget)
         raise OutOfSpaceError("垃圾整理后仍无空白物理页")
+
+    def _reserve_pages(self, need, budget):
+        """在不消耗空白页的前提下，保证可立即分配 need 个用户页。
+
+        空白页（保留 GC_RESERVE_PAGES 后）不足时先做垃圾整理；整理仍不足
+        抛 OutOfSpaceError，预算不允许抛 GCBudgetExhaustedError。
+        供事务提交在写任何事务数据页之前完成“容量必须先拒绝”的决策。
+        """
+        # 每次整理擦除一个不同的块（擦后无死页，保留循环内不会再被选中），
+        # 因此至多 BLOCKS 次；超过即内部状态错误。
+        for _ in range(BLOCKS + 1):
+            if self._total_blanks() >= GC_RESERVE_PAGES + need:
+                return
+            self._reclaim_one_block(set(), 0, budget)
+        raise FTLError("容量预留循环异常，判定为内部状态错误")
 
     def _commit_mapping(self, updates, exclude, depth, budget, reserve, *, purpose):
         """写一条提交记录：先分配提交页（可能触发 GC 搬迁并改变当前映射），

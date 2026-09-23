@@ -12,7 +12,9 @@
   ``OutOfSpaceError`` 严格区分：此时仍存在可回收块，只是本次操作的
   预算不允许继续。
 - ``BadBlockError``：对坏块的读/写/擦除尝试；坏块永不再分配。
-- ``BlockWornError``：块的擦除次数达到输入给定的磨损上限。
+- ``BlockWornError``：块的擦除次数已达输入给定的磨损上限。
+- ``TransactionError``：事务状态机违例——未开启事务就暂存/提交/搁置、
+  重复开启、事务进行中调用自动提交写或手动垃圾整理等。
 """
 
 
@@ -42,3 +44,7 @@ class BadBlockError(FTLError):
 
 class BlockWornError(FTLError):
     """磨损极限：块的擦除次数已达输入给定的上限。"""
+
+
+class TransactionError(FTLError):
+    """事务状态机违例：开启/暂存/提交/搁置的调用顺序或并发约束被违反。"""
