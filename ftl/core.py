@@ -14,6 +14,9 @@
   搬迁（最多 7 个有效页 + 1 条提交记录）总能容纳；保留页不可被用户写耗尽。
 - 分配按（擦除次数升序, 空白页数降序, 块号升序）选块，实现静态磨损均衡；
   坏块与磨损块（擦除次数达上限）永不分配、永不作为整理对象。
+- 原子事务（transaction）：1..4 个逻辑页整笔提交——先写全部数据页，
+  最后一条提交记录携带全部更新；写任何数据页前先做容量预检（必要时
+  先在预算内垃圾整理），容量不足在事务体写入之前拒绝。
 """
 from __future__ import annotations
 
@@ -33,6 +36,7 @@ from .validation import INT_CAP, require_bytes, require_int
 
 LOGICAL_PAGES = 24
 GC_RESERVE_PAGES = PAGES_PER_BLOCK  # 为用户分配保留 1 块，保障 GC 搬迁有处可去
+MAX_TXN_PAGES = 4  # 单笔原子事务最多覆盖的逻辑页数
 _UNMAPPED = 0xFF
 _COMMIT_MAGIC = 0xA5
 _SEQ_MAX = 0xFFFFFF  # 24 位序列号空间
@@ -79,6 +83,40 @@ def decode_commit_record(page):
             return None
         seen.add(ppn)
     return seq, mapping
+
+
+def _validate_txn_writes(writes):
+    """把事务写入集规范化为 [(lpn, data), ...]。
+
+    全部校验在任何物理动作之前完成：页数 1..MAX_TXN_PAGES、每项为
+    (lpn, data) 对、lpn 合法且不重复、data 为 1..32 字节。
+    """
+    if isinstance(writes, dict):
+        pairs = list(writes.items())
+    else:
+        try:
+            pairs = list(writes)
+        except TypeError:
+            raise InvalidInputError(
+                f"writes 必须是 (lpn, data) 对的可迭代对象或 dict，得到 {writes!r}"
+            ) from None
+    if not 1 <= len(pairs) <= MAX_TXN_PAGES:
+        raise InvalidInputError(
+            f"事务页数必须在 1..{MAX_TXN_PAGES}，得到 {len(pairs)} 笔"
+        )
+    items = []
+    seen = set()
+    for item in pairs:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise InvalidInputError(f"事务项必须是 (lpn, data) 对，得到 {item!r}")
+        lpn, data = item
+        lpn = require_int("lpn", lpn, 0, LOGICAL_PAGES - 1)
+        data = require_bytes("data", data, min_len=1, max_len=PAGE_SIZE)
+        if lpn in seen:
+            raise InvalidInputError(f"事务内 lpn={lpn} 重复：一页一笔，语义才无歧义")
+        seen.add(lpn)
+        items.append((lpn, data))
+    return items
 
 
 class _BlockView:
@@ -201,6 +239,57 @@ class FTL:
             {"op": "write", "lpn": lpn, "size": len(data), "seq": self._seq}
         )
 
+    def transaction(self, writes, *, gc_budget=None):
+        """原子事务：把 1..MAX_TXN_PAGES 个逻辑页的覆盖写作为整笔提交。
+
+        - 数据页与提交记录分开：先写全部数据页（txn-data），最后写一条
+          携带全部更新的提交记录（txn-commit）。提交记录整页写成功前，
+          恢复只能看到整笔旧值；写成功后只能看到整笔新值（全有或全无）。
+        - 容量不足先拒绝：写任何事务数据页之前先做预算内的垃圾整理预检，
+          确保空白页足以容纳 数据页 + 提交记录；预检失败抛
+          OutOfSpaceError / GCBudgetExhaustedError，事务体不写任何页。
+        - 失败（非法输入/空间/预算/坏块/磨损）不改变已提交逻辑映像；
+          物理层可能留下未提交的孤儿页（已说明的部分变更，GC 会回收），
+          预检阶段也可能已做垃圾整理（对已提交映像不可见）。
+        """
+        items = _validate_txn_writes(writes)
+        budget = self._resolve_budget(gc_budget)
+        if self._seq >= _SEQ_MAX:
+            raise FTLError(f"提交序列号空间（{_SEQ_MAX}）已耗尽")
+        self._gc_spent = 0
+        self._rebuild_view()
+        need = len(items) + 1  # 数据页 + 1 条提交记录
+        try:
+            self._ensure_blank_headroom(need, budget)
+            ppns = []
+            try:
+                for lpn, data in items:
+                    ppn = self._alloc_page(set())
+                    if ppn is None:  # 预检保证不会发生，防御性检查
+                        raise FTLError("内部状态错误：容量预检后仍无空白页")
+                    self._pinned.add(ppn)
+                    ppns.append(ppn)
+                    self._program(ppn, data, purpose="txn-data")
+                updates = {lpn: ppn for (lpn, _), ppn in zip(items, ppns)}
+                # 提交内容在 _commit_mapping 内部基于最新映射构建
+                self._commit_mapping(
+                    updates, set(), 0, budget, GC_RESERVE_PAGES, purpose="txn-commit"
+                )
+            finally:
+                for ppn in ppns:
+                    self._pinned.discard(ppn)
+        except (BadBlockError, BlockWornError):
+            self._rebuild_view()
+            raise
+        self._logical_log.append(
+            {
+                "op": "transaction",
+                "lpns": tuple(lpn for lpn, _ in items),
+                "pages": len(items),
+                "seq": self._seq,
+            }
+        )
+
     def read(self, lpn):
         """读逻辑页：返回 32 字节槽（写入数据的前缀，余为 0xFF 填充）；未映射返回 None。"""
         lpn = require_int("lpn", lpn, 0, LOGICAL_PAGES - 1)
@@ -312,6 +401,18 @@ class FTL:
                 raise FTLError("垃圾整理嵌套深度异常，判定为内部状态错误")
             self._reclaim_one_block(exclude, depth, budget)
         raise OutOfSpaceError("垃圾整理后仍无空白物理页")
+
+    def _ensure_blank_headroom(self, need, budget):
+        """事务容量预检：保证空白物理页 >= need + GC 保留页，不足先垃圾整理。
+
+        在任何事务数据页写入之前调用；失败抛 OutOfSpaceError（证明无解）
+        或 GCBudgetExhaustedError（预算耗尽），此时事务尚未写任何数据页。
+        """
+        for _ in range(BLOCKS + 1):
+            if self._total_blanks() >= need + GC_RESERVE_PAGES:
+                return
+            self._reclaim_one_block(set(), 0, budget)
+        raise OutOfSpaceError("垃圾整理后空白页仍不足以容纳整笔事务")
 
     def _commit_mapping(self, updates, exclude, depth, budget, reserve, *, purpose):
         """写一条提交记录：先分配提交页（可能触发 GC 搬迁并改变当前映射），

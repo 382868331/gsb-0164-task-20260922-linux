@@ -110,7 +110,55 @@ def part_boundary():
             print(f"  非法输入被拒绝 [{label}]: {e}")
 
 
+def part_transaction():
+    print("=== 第三部分（原子事务）：整笔全有或全无、逐点掉电、容量先拒绝 ===")
+    dev = RawNand(max_erases=8)
+    ftl = FTL(dev)
+    old = [(i, payload(100 + i)) for i in range(4)]
+    for lpn, data in old:
+        ftl.write(lpn, data)
+    new = [(i, payload(200 + i)) for i in range(4)]
+
+    seq0 = ftl.commit_seq
+    ftl.transaction(new)  # 4 页一笔事务：4 个数据页 + 1 条提交记录
+    ok = all(ftl.read(l) == d.ljust(PAGE_SIZE, b"\xff") for l, d in new)
+    print(f"  4 页事务提交成功，4 页全部读回新值: {ok}，"
+          f"提交序列号 {seq0} -> {ftl.commit_seq}（恰好 +1）")
+
+    print("  -- 注入掉电：事务第 2 个物理动作（第 2 个数据页）后断电 --")
+    newer = [(i, payload(250 + i)) for i in range(4)]
+    dev.set_crash_plan([2])
+    dev.arm_crash()
+    try:
+        ftl.transaction(newer)
+        print("  错误：应发生掉电")
+    except PowerLossError as e:
+        print(f"  捕获 PowerLossError: {e}")
+    dev.reboot()
+    ftl2 = FTL(dev)  # 重启后重新挂载 = 恢复
+    kept = all(ftl2.read(l) == d.ljust(PAGE_SIZE, b"\xff") for l, d in new)
+    leaked = any(ftl2.read(l) == d.ljust(PAGE_SIZE, b"\xff") for l, d in newer)
+    print(f"  重启恢复：整笔旧值保留={kept}，半笔新值泄漏={leaked}（应为 False）")
+
+    print("  -- 容量不足必须先拒绝（max_erases=0，空白页不足以容纳整笔） --")
+    dev2 = RawNand(max_erases=0)  # 禁止擦除：死页不可回收
+    ftl3 = FTL(dev2)
+    i = 0
+    while ftl3.capacity()["free_physical_pages"] > 8:  # 写满到 GC 保留页边界
+        ftl3.write(i % 24, payload(i))
+        i += 1
+    n_actions = len(dev2.action_log())
+    try:
+        ftl3.transaction([(0, b"a"), (1, b"b"), (2, b"c"), (3, b"d")])
+        print("  错误：应触发空间不足")
+    except OutOfSpaceError as e:
+        print(f"  4 页事务被拒绝 OutOfSpaceError: {e}")
+    untouched = len(dev2.action_log()) == n_actions
+    print(f"  拒绝发生在任何事务写入之前（物理动作数不变）: {untouched}")
+
+
 if __name__ == "__main__":
     part_normal()
     part_boundary()
+    part_transaction()
     print("演示结束。")
