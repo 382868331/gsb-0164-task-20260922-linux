@@ -110,7 +110,86 @@ def part_boundary():
             print(f"  非法输入被拒绝 [{label}]: {e}")
 
 
+def part_trim():
+    print("=== 第三部分（逻辑页释放 trim）：整组原子生效、断电恢复、非法拒绝 ===")
+    dev = RawNand(max_erases=8)
+    ftl = FTL(dev)
+    shadow = {}
+    for i in range(12):
+        ftl.write(i, payload(i))
+        shadow[i] = payload(i)
+    n0 = len(ftl.physical_log())
+    released = ftl.trim([2, 5, 7, 7])  # 重复页号按幂等处理
+    n1 = len(ftl.physical_log())
+    for l in (2, 5, 7):
+        shadow.pop(l)
+    none_ok = all(ftl.read(l) is None for l in (2, 5, 7))
+    kept = all(ftl.read(l) == shadow[l].ljust(PAGE_SIZE, b"\xff") for l in shadow)
+    print(f"  trim([2,5,7,7]) 实际释放 {released} 页，物理动作 {n1 - n0} 次（单条提交记录）")
+    print(f"  释放后读返回 None: {none_ok}；其余活页数据保留: {kept}")
+    show_capacity("trim 后", ftl)
+    reclaimed = ftl.gc_collect()
+    kept = all(ftl.read(l) == shadow[l].ljust(PAGE_SIZE, b"\xff") for l in shadow)
+    print(f"  手动 GC 回收 {reclaimed} 块（含被释放死页），活页数据仍一致: {kept}")
+    show_capacity("GC 后", ftl)
+
+    print("  -- 释放后重写：照旧走分配流程 --")
+    ftl.write(5, b"REWRITE")
+    print(f"  重写 lpn=5 并读回: {ftl.read(5)[:7].decode()!r}")
+
+    print("  -- trim 中途掉电：恢复后只见全部释放前或全部释放后 --")
+    dev2 = RawNand(max_erases=8)
+    for b in range(9):
+        dev2.mark_factory_bad(b)  # 仅剩 7 块：trim 的提交页必须先做带搬迁的 GC
+    ftl2 = FTL(dev2)
+    i = 0
+    while ftl2.capacity()["free_physical_pages"] > 8:
+        ftl2.write(i % 24, payload(i))
+        i += 1
+    snap = dev2.snapshot()
+    n0 = len(dev2.action_log())
+    ftl2.trim([0, 1, 2, 3])
+    total = len(dev2.action_log()) - n0
+    mid = total // 2  # 提交记录落盘之前的某个断电点（GC 搬迁中途）
+    dev2.restore(snap)
+    dev2.set_crash_plan([mid])
+    dev2.arm_crash()
+    try:
+        FTL(dev2).trim([0, 1, 2, 3])
+        print("  错误：应发生掉电")
+    except PowerLossError as e:
+        print(f"  trim 第 {mid}/{total} 个物理动作后掉电: {e}")
+    dev2.reboot()
+    ftl3 = FTL(dev2)
+    kept = all(ftl3.read(l) == payload(l).ljust(PAGE_SIZE, b"\xff") for l in (0, 1, 2, 3))
+    print(f"  恢复：提交未落盘 → 4 页全部保持释放前映射: {kept}")
+    dev2.restore(snap)  # 重放同一轨迹，这次让提交落盘后才掉电
+    dev2.set_crash_plan([total])
+    dev2.arm_crash()
+    try:
+        FTL(dev2).trim([0, 1, 2, 3])
+        print("  错误：应发生掉电")
+    except PowerLossError as e:
+        print(f"  trim 第 {total}/{total} 个物理动作后掉电: {e}")
+    dev2.reboot()
+    ftl4 = FTL(dev2)
+    gone = all(ftl4.read(l) is None for l in (0, 1, 2, 3))
+    print(f"  恢复：提交已落盘 → 4 页全部释放生效: {gone}")
+
+    print("  -- 非法页号：任何物理动作之前整次拒绝 --")
+    n0 = len(ftl4.physical_log())
+    try:
+        ftl4.trim([5, 24])  # 24 越界：整次拒绝，合法的 5 也不释放
+        print("  错误：应拒绝非法页号")
+    except InvalidInputError as e:
+        print(f"  trim([5, 24]) 被拒绝 InvalidInputError: {e}")
+    unchanged = len(ftl4.physical_log()) == n0
+    alive = ftl4.read(5) == payload(5).ljust(PAGE_SIZE, b"\xff")
+    print(f"  拒绝前后物理动作数不变: {unchanged}；同组合法页 lpn=5 未受影响: {alive}")
+
+
 if __name__ == "__main__":
     part_normal()
     part_boundary()
+    part_trim()
     print("演示结束。")

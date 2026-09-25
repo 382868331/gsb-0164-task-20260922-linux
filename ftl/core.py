@@ -10,6 +10,10 @@
 - 垃圾整理：先把受害块内仍有效的页搬迁他处并提交新映射，
   提交成功后才擦除受害块——掉电安全。若受害块含有当前最新提交记录，
   擦除前强制先写一条新提交记录（即使无需搬迁数据页）。
+- 逻辑页释放 trim(lpn_list)：整组解除映射通过一条映像提交记录生效
+  （全有或全无）；已未映射页与重复页号幂等，空列表/全未映射不产生
+  物理写入也不消耗提交序号；任一非法页号在任何物理动作之前拒绝整次
+  请求。释放只撤销逻辑映射，物理页转为死页纳入既有 GC 与容量统计。
 - GC 保留页：为用户态分配保留 1 块（8 页）余量，保证任何单块回收的
   搬迁（最多 7 个有效页 + 1 条提交记录）总能容纳；保留页不可被用户写耗尽。
 - 分配按（擦除次数升序, 空白页数降序, 块号升序）选块，实现静态磨损均衡；
@@ -213,6 +217,63 @@ class FTL:
             {"op": "read", "lpn": lpn, "result": "ok", "ppn": ppn}
         )
         return data
+
+    def trim(self, lpns, *, gc_budget=None):
+        """释放一组逻辑页：整组通过一条映像提交记录生效（全有或全无）。
+
+        - 已未映射的页与重复页号按幂等处理；空列表或全部未映射时不产生
+          任何物理写入，也不消耗提交序列号（返回 0）。
+        - 混入任何一个非法页号，整次请求在任何物理动作之前拒绝。
+        - 释放只撤销逻辑映射：被释放的物理页转为死页，纳入既有 GC 与
+          容量统计，不立即擦除；同块其他有效页不受影响。不修改任何
+          已编程的 NAND 页。
+        - 提交记录空间不足时与写操作同一套语义：预算耗尽抛
+          GCBudgetExhaustedError，可证明无解抛 OutOfSpaceError；
+          失败不改变已提交逻辑映像（物理层可能留下未提交的孤儿页，
+          属已说明的部分变更，GC 会回收）。
+
+        返回本次实际新释放的逻辑页数。
+        """
+        if isinstance(lpns, (str, bytes, bytearray, memoryview)):
+            raise InvalidInputError(
+                f"lpn_list 必须是逻辑页号的可迭代序列，得到 {type(lpns).__name__}"
+            )
+        try:
+            items = list(lpns)
+        except TypeError:
+            raise InvalidInputError(
+                f"lpn_list 必须是逻辑页号的可迭代序列，得到 {lpns!r}"
+            ) from None
+        for x in items:
+            require_int("lpn", x, 0, LOGICAL_PAGES - 1)
+        budget = self._resolve_budget(gc_budget)
+        targets = sorted(set(items))
+        updates = {
+            lpn: _UNMAPPED for lpn in targets if self._mapping[lpn] != _UNMAPPED
+        }
+        if not updates:
+            self._logical_log.append(
+                {"op": "trim", "lpns": tuple(targets), "released": 0, "seq": self._seq}
+            )
+            return 0
+        self._gc_spent = 0
+        self._rebuild_view()
+        try:
+            self._commit_mapping(
+                updates, set(), 0, budget, GC_RESERVE_PAGES, purpose="trim-commit"
+            )
+        except (BadBlockError, BlockWornError):
+            self._rebuild_view()
+            raise
+        self._logical_log.append(
+            {
+                "op": "trim",
+                "lpns": tuple(targets),
+                "released": len(updates),
+                "seq": self._seq,
+            }
+        )
+        return len(updates)
 
     def gc_collect(self, *, gc_budget=None):
         """手动垃圾整理：在预算内回收所有可回收块，返回成功擦除的块数。"""
