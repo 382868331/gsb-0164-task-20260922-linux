@@ -1,8 +1,11 @@
-"""合成 FTL 核心：页映射、断电安全提交、垃圾整理与磨损管理。
+"""合成 FTL 核心：页映射、断电安全提交、垃圾整理、磨损管理与逻辑页释放。
 
 设计要点（与 README 一致）：
 - 逻辑页覆盖写 = 写新数据页 + 写一条带 CRC32 的映射提交记录；
   提交记录整页写成功后才可见（设备保证页写原子，掉电只发生在动作边界）。
+- 逻辑页释放（trim）= 把一组 lpn 的映射项改为未映射，通过同一条整映像
+  提交记录原子生效：掉电重挂载只能看到释放前或整组释放后的映像。
+  释放只撤映射、不立即擦块；旧数据页成为死页，计入既有 GC 与容量统计。
 - 提交记录为整映像快照，单页 32 字节：magic(1) + seq(3, 小端)
   + mapping(24) + crc32(4)。因此逻辑页数固定为 24。
 - 恢复时扫描全部物理页，取序列号最大（同号取物理页号大者）的
@@ -213,6 +216,73 @@ class FTL:
             {"op": "read", "lpn": lpn, "result": "ok", "ppn": ppn}
         )
         return data
+
+    def trim(self, lpn_list, *, gc_budget=None):
+        """释放一组逻辑页：整组通过一条新的映像提交记录原子生效。
+
+        - 已未映射的页与重复页号按幂等处理；空列表或全部已未映射时
+          不产生任何物理写入、不消耗提交序列号，返回 0。
+        - 只要混入一个非法页号（非 int/bool/越界等），整次请求在任何
+          物理动作之前抛 InvalidInputError，已提交映像不变。
+        - 释放只撤逻辑映射，不立即擦除物理块：旧数据页成为死页，计入
+          既有容量统计并由既有 GC 回收；同块其他有效页在 GC 时照常搬迁。
+        - 提交页分配同样可能触发 GC；预算耗尽 / 容量不足沿用写路径的
+          GCBudgetExhaustedError / OutOfSpaceError 区分。
+        返回实际由“已映射”变为“未映射”的页数。
+        """
+        # 全部输入校验先于任何物理动作（含 GC），非法则整组拒绝
+        lpns = self._validate_lpn_list(lpn_list)
+        budget = self._resolve_budget(gc_budget)
+        self._gc_spent = 0
+        self._rebuild_view()
+        targets = sorted({lpn for lpn in lpns if self._mapping[lpn] != _UNMAPPED})
+        if not targets:
+            # 幂等空操作：零物理写入、零序列号推进
+            self._logical_log.append(
+                {"op": "trim", "requested": len(lpns), "released": 0, "seq": self._seq}
+            )
+            return 0
+        updates = {lpn: _UNMAPPED for lpn in targets}
+        try:
+            # 与写同一条提交路径：整映像快照落页后整组释放才可见，
+            # 掉电重挂载只能看到释放前或全部释放后的映像。
+            self._commit_mapping(
+                updates, set(), 0, budget, GC_RESERVE_PAGES, purpose="trim-commit"
+            )
+        except (BadBlockError, BlockWornError):
+            self._rebuild_view()
+            raise
+        self._logical_log.append(
+            {
+                "op": "trim",
+                "requested": len(lpns),
+                "released": len(targets),
+                "lpns": tuple(targets),
+                "seq": self._seq,
+            }
+        )
+        return len(targets)
+
+    @staticmethod
+    def _validate_lpn_list(lpn_list):
+        """校验 lpn_list 为有限 int 序列（拒绝 str/bytes-like 与非可迭代对象）。
+
+        只做类型/范围校验并物化，去重与幂等判断由调用方处理。
+        """
+        if isinstance(lpn_list, (str, bytes, bytearray, memoryview, dict)):
+            raise InvalidInputError(
+                "参数 lpn_list 必须是 int 的可迭代序列（拒绝 str/bytes-like/dict），"
+                f"得到 {lpn_list!r}"
+            )
+        try:
+            items = list(lpn_list)
+        except TypeError:
+            raise InvalidInputError(
+                f"参数 lpn_list 必须是可迭代的 int 序列，得到 {lpn_list!r}"
+            ) from None
+        return [
+            require_int("lpn_list 元素", x, 0, LOGICAL_PAGES - 1) for x in items
+        ]
 
     def gc_collect(self, *, gc_budget=None):
         """手动垃圾整理：在预算内回收所有可回收块，返回成功擦除的块数。"""

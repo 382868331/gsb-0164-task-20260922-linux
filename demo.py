@@ -75,6 +75,74 @@ def part_normal():
     show_capacity("恢复后", ftl2)
 
 
+def part_trim():
+    print("=== 第三部分（逻辑页释放 trim）：整组原子释放、断电恢复、非法整组拒绝 ===")
+    dev = RawNand(max_erases=8)
+    ftl = FTL(dev)
+    expected = {}
+    for i in range(10):
+        ftl.write(i, payload(i))
+        expected[i] = payload(i)
+    show_capacity("释放前", ftl)
+
+    n0 = len(dev.action_log())
+    released = ftl.trim([1, 3, 5, 3, 20])  # 3 重复、20 未映射：幂等处理
+    actions = dev.action_log()[n0:]
+    for lpn in (1, 3, 5):
+        del expected[lpn]
+    ok = all(ftl.read(l) is None for l in (1, 3, 5, 20)) and all(
+        ftl.read(l) == d.ljust(PAGE_SIZE, b"\xff") for l, d in expected.items()
+    )
+    print(
+        f"  trim([1,3,5,3,20]) 实际释放 {released} 页，物理动作 "
+        f"{len(actions)} 个（{actions[0].purpose}）：释放后读回与其余页保持: {ok}"
+    )
+    show_capacity("释放后", ftl)
+
+    print("  -- 注入掉电：trim 提交记录落页完成的瞬间断电 --")
+    dev.set_crash_plan([1])  # trim 的唯一物理动作（trim-commit）完成后掉电
+    dev.arm_crash()
+    try:
+        ftl.trim([0, 2, 4])
+        print("  错误：应发生掉电")
+    except PowerLossError as e:
+        print(f"  捕获 PowerLossError: {e}")
+    dev.reboot()
+    ftl2 = FTL(dev)  # 重启重挂载：提交已完成 → 整组释放全部可见
+    for lpn in (0, 2, 4):
+        del expected[lpn]
+    gone = all(ftl2.read(l) is None for l in (0, 2, 4))
+    kept = all(ftl2.read(l) == d.ljust(PAGE_SIZE, b"\xff") for l, d in expected.items())
+    print(f"  重启恢复：整组释放全部生效={gone}，其余页无损={kept}（无半释放状态）")
+
+    print("  -- 释放后重写：照旧走新页分配 --")
+    ftl2.write(2, b"REWRITTEN")
+    expected[2] = b"REWRITTEN"
+    print(f"  重写 lpn=2 并读回: {ftl2.read(2)[:9].decode()!r}")
+    reclaimed = ftl2.gc_collect()
+    ok = all(ftl2.read(l) == d.ljust(PAGE_SIZE, b"\xff") for l, d in expected.items())
+    print(f"  手动 GC 回收 {reclaimed} 块（含 trim 死页），活页数据完整: {ok}")
+    show_capacity("GC 后", ftl2)
+
+    print("  -- 非法页号：整次请求在任何物理动作之前拒绝 --")
+    n0 = len(dev.action_log())
+    seq = ftl2.commit_seq
+    try:
+        ftl2.trim([6, 24])  # 24 越界 → 整组拒绝，lpn=6 也不得释放
+        print("  错误：应拒绝非法页号")
+    except InvalidInputError as e:
+        print(f"  捕获 InvalidInputError: {e}")
+    untouched = (
+        len(dev.action_log()) == n0
+        and ftl2.commit_seq == seq
+        and ftl2.read(6) == expected[6].ljust(PAGE_SIZE, b"\xff")
+    )
+    print(f"  零物理动作、序列号未推进、lpn=6 未被波及: {untouched}")
+    n0 = len(dev.action_log())
+    r = ftl2.trim([])  # 空列表：幂等空操作
+    print(f"  trim([]) 返回 {r}，物理动作增加 {len(dev.action_log()) - n0} 个")
+
+
 def part_boundary():
     print("=== 第二部分（实际触发的拒绝/异常边界）：磨损极限与非法输入 ===")
     dev = RawNand(max_erases=1)  # 每块只允许擦除 1 次
@@ -112,5 +180,6 @@ def part_boundary():
 
 if __name__ == "__main__":
     part_normal()
+    part_trim()
     part_boundary()
     print("演示结束。")
