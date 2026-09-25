@@ -11,6 +11,7 @@ from ftl import (
     OutOfSpaceError,
     PowerLossError,
     RawNand,
+    encode_commit_record,
     require_finite_number,
 )
 from ftl.errors import BlockWornError
@@ -110,7 +111,68 @@ def part_boundary():
             print(f"  非法输入被拒绝 [{label}]: {e}")
 
 
+def part_wear_level():
+    print("=== 第三部分（主动磨损均衡 wear_level）：冷页搬迁、预算报告、断电恢复 ===")
+    # 确定性构造：块 0/1 装满冷数据（擦除 0 次），块 12/13 已擦 3 次、
+    # 其余空白块已擦 2 次；提交记录用公开编码器写入块 2。
+    dev = RawNand(max_erases=10)
+    for b, times in [(12, 3), (13, 3)] + [(b, 2) for b in range(2, 16) if b not in (12, 13)]:
+        for _ in range(times):
+            dev.erase(b, purpose="setup-wear")
+    mapping = [0xFF] * 24
+    expected = {}
+    for b, lpns in ((0, range(0, 8)), (1, range(8, 16))):
+        for i, lpn in enumerate(lpns):
+            data = payload(lpn)
+            dev.program(b, i, data, purpose="cold-data")
+            mapping[lpn] = b * 8 + i
+            expected[lpn] = data
+    dev.program(2, 0, encode_commit_record(1, mapping), purpose="setup-commit")
+
+    ftl = FTL(dev)
+    counts = ftl.capacity()["erase_counts"]
+    print(f"  维护前擦除次数: 块0={counts[0]} 块1={counts[1]} 块12={counts[12]} 块13={counts[13]}")
+
+    snap = dev.snapshot()
+    report = ftl.wear_level(64, threshold=2)
+    print(f"  wear_level(64, threshold=2) 报告: {report}")
+    counts = ftl.capacity()["erase_counts"]
+    print(f"  维护后擦除次数: 块0={counts[0]} 块1={counts[1]} 块12={counts[12]} 块13={counts[13]}")
+    ok = all(ftl.read(l) == expected[l].ljust(PAGE_SIZE, b"\xff") for l in expected)
+    print(f"  搬迁后 16 个冷页逻辑内容全部不变: {ok}")
+    landed = {ftl.mapping_snapshot()[l] // 8 for l in range(16)}
+    print(f"  冷页现位于块 {sorted(landed)}（擦写较多的空块），块 0/1 已腾空待重新分配")
+
+    print("  -- 预算按实际物理动作计：max_moves=10 恰好够整理一个块 --")
+    dev.restore(snap)
+    ftl = FTL(dev)
+    report = ftl.wear_level(10, threshold=2)
+    print(f"  wear_level(10, threshold=2) 报告: {report}（预算耗尽与空间不足分开报告）")
+
+    print("  -- 枚举维护过程每个断电点：掉电重挂载后逻辑映像不得丢失 --")
+    dev.restore(snap)
+    ftl = FTL(dev)
+    total = ftl.wear_level(64, threshold=2)["actions"]
+    recovered = 0
+    for k in range(1, total + 1):
+        dev.restore(snap)
+        dev.set_crash_plan([k])
+        dev.arm_crash()
+        try:
+            FTL(dev).wear_level(64, threshold=2)
+            print("  错误：应发生掉电")
+            return
+        except PowerLossError:
+            pass
+        dev.reboot()
+        ftl2 = FTL(dev)  # 重启重挂载 = 恢复
+        if all(ftl2.read(l) == expected[l].ljust(PAGE_SIZE, b"\xff") for l in expected):
+            recovered += 1
+    print(f"  枚举 {total} 个断电点：{recovered}/{total} 恢复到最后已提交映像")
+
+
 if __name__ == "__main__":
     part_normal()
     part_boundary()
+    part_wear_level()
     print("演示结束。")
