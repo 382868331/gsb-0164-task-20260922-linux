@@ -14,6 +14,11 @@
   搬迁（最多 7 个有效页 + 1 条提交记录）总能容纳；保留页不可被用户写耗尽。
 - 分配按（擦除次数升序, 空白页数降序, 块号升序）选块，实现静态磨损均衡；
   坏块与磨损块（擦除次数达上限）永不分配、永不作为整理对象。
+- 显式磨损均衡 wear_level(max_moves)：一次性有限维护（无后台线程、不被
+  write/gc 自动调用）。把低磨损块中长期持有的有效页整块迁往擦除次数严格
+  更多但仍可用（未坏、未达磨损上限）的空白页，新映像提交可见后才擦除
+  源块，使低磨损块以空白块身份重新进入分配。源块按（擦除次数升序,
+  块号升序）选取；预算按有效页搬迁数封顶，实际物理动作按实结算。
 """
 from __future__ import annotations
 
@@ -226,6 +231,57 @@ class FTL:
         self._logical_log.append({"op": "gc", "reclaimed": reclaimed})
         return reclaimed
 
+    def wear_level(self, max_moves):
+        """显式磨损均衡：一次性有限维护（无后台线程，write/gc 不会自动调用）。
+
+        把低磨损块中长期持有的有效（冷）页迁往擦除次数严格更多、但仍可用
+        （非坏块、未达磨损上限）的空白页，新映像提交可见后才擦除源块，
+        使低磨损块以空白块身份重新进入分配。最多搬迁 max_moves 个有效页
+        （预算按有效页数封顶，实际物理动作按实结算并如实报告）。
+
+        返回报告 dict：
+        - moved_pages：实际搬迁的有效页数
+        - leveled_blocks：被腾空并擦除的源块（按处理顺序）
+        - program_actions / erase_actions：本次维护实际发生的物理动作数
+        - stop_reason：no-candidate（无候选/未达阈值，无动作）、
+          budget-exhausted（max_moves 用尽或不足搬迁下一块）、
+          insufficient-space（可用空白页不足以腾空下一块；空间不足与预算
+          耗尽分开报告）
+        逻辑页内容不被改变；中途掉电可能留下孤儿页，但恢复的逻辑数据不丢。
+        """
+        max_moves = require_int("max_moves", max_moves, 0, INT_CAP)
+        self._rebuild_view()
+        log0 = len(self._dev.action_log())
+        moved = 0
+        leveled = []
+        stop = "no-candidate"
+        while moved < max_moves:
+            src = self._pick_wear_source()
+            if src is None:
+                break
+            n = self._view[src].valid
+            if moved + n > max_moves:
+                stop = "budget-exhausted"
+                break
+            if self._wear_slots(src) < n or self._blank_pages_outside(src) < n + 1:
+                stop = "insufficient-space"
+                break
+            self._wear_evacuate(src)
+            moved += n
+            leveled.append(src)
+        else:
+            stop = "budget-exhausted"  # 预算恰好用尽：不再探查是否还有候选
+        actions = self._dev.action_log()[log0:]
+        report = {
+            "moved_pages": moved,
+            "leveled_blocks": tuple(leveled),
+            "program_actions": sum(1 for a in actions if a.kind == "program"),
+            "erase_actions": sum(1 for a in actions if a.kind == "erase"),
+            "stop_reason": stop,
+        }
+        self._logical_log.append({"op": "wear_level", **report})
+        return report
+
     def capacity(self):
         """剩余容量与磨损快照（全部为精确整数，无浮点）。"""
         self._rebuild_view()
@@ -320,6 +376,12 @@ class FTL:
         if self._seq >= _SEQ_MAX:
             raise FTLError(f"提交序列号空间（{_SEQ_MAX}）已耗尽")
         ppn = self._ensure_free_page(exclude, depth + 1, budget, reserve)
+        self._write_commit(ppn, updates, purpose)
+
+    def _write_commit(self, ppn, updates, purpose):
+        """在指定（已确保空白的）页上写整映像提交记录并更新映射状态。"""
+        if self._seq >= _SEQ_MAX:
+            raise FTLError(f"提交序列号空间（{_SEQ_MAX}）已耗尽")
         new_mapping = list(self._mapping)
         for lpn, ppn_new in updates.items():
             new_mapping[lpn] = ppn_new
@@ -396,4 +458,125 @@ class FTL:
             self._rebuild_view()
             raise
         self._gc_spent += 1
+        self._rebuild_view()
+
+    # ------------------------------------------------------------------
+    # 内部：显式磨损均衡（一次性维护，不与 GC 预算/嵌套共用）
+    # ------------------------------------------------------------------
+    def _usable(self, b):
+        """块仍可用：非坏块且未达磨损上限（擦除仍被允许）。"""
+        dev = self._dev
+        return not dev.is_bad_block(b) and dev.erase_count(b) < dev.max_erases
+
+    def _pick_wear_source(self):
+        """选磨损均衡源块：持有有效页、可擦除，且存在擦除次数严格更高的
+        可用块。按（擦除次数升序, 块号升序）确定；无候选返回 None。"""
+        dev = self._dev
+        best = None
+        for b in range(BLOCKS):
+            if not self._usable(b) or self._view[b].pinned > 0:
+                continue
+            if self._view[b].valid == 0:
+                continue
+            if not any(
+                self._usable(h) and dev.erase_count(h) > dev.erase_count(b)
+                for h in range(BLOCKS)
+            ):
+                continue  # 没有擦写更多的可用块：未达阈值，不动
+            key = (dev.erase_count(b), b)
+            if best is None or key < best[0]:
+                best = (key, b)
+        return None if best is None else best[1]
+
+    def _wear_target_block(self, src):
+        """选搬迁目标块：非源块、可用、擦除次数严格高于源块且有空白页；
+        按（擦除次数升序, 块号升序）确定——等磨损平局由块号打破，
+        同一块填满后再换下一块（在更高磨损块中取最保守者）。"""
+        dev = self._dev
+        src_count = dev.erase_count(src)
+        candidates = []
+        for b in range(BLOCKS):
+            if b == src or not self._usable(b):
+                continue
+            if dev.erase_count(b) <= src_count or self._view[b].blanks == 0:
+                continue
+            candidates.append((dev.erase_count(b), b))
+        candidates.sort()
+        return None if not candidates else candidates[0][1]
+
+    def _wear_alloc(self, src):
+        """在合格目标块上分配一个空白页；无合格页返回 None。"""
+        b = self._wear_target_block(src)
+        if b is None:
+            return None
+        for p in range(PAGES_PER_BLOCK):
+            if self._dev.is_blank(b, p):
+                return b * PAGES_PER_BLOCK + p
+        return None
+
+    def _wear_slots(self, src):
+        """合格目标块上的空白页总数。"""
+        dev = self._dev
+        src_count = dev.erase_count(src)
+        total = 0
+        for b in range(BLOCKS):
+            if b == src or not self._usable(b):
+                continue
+            if dev.erase_count(b) > src_count:
+                total += self._view[b].blanks
+        return total
+
+    def _blank_pages_outside(self, src):
+        """源块之外所有可用块的空白页总数（供提交记录页落脚）。"""
+        return sum(
+            self._view[b].blanks
+            for b in range(BLOCKS)
+            if b != src and self._usable(b)
+        )
+
+    def _wear_alloc_commit(self, src):
+        """为提交记录分配空白页：源块之外、任何仍可用（未坏、未磨损）的
+        块均可，按分配器常规次序（擦除次数升序, 空白页数降序, 块号升序）。"""
+        dev = self._dev
+        candidates = []
+        for b in range(BLOCKS):
+            if b == src or not self._usable(b) or self._view[b].blanks == 0:
+                continue
+            candidates.append(((dev.erase_count(b), -self._view[b].blanks, b), b))
+        candidates.sort()
+        for _, b in candidates:
+            for p in range(PAGES_PER_BLOCK):
+                if dev.is_blank(b, p):
+                    return b * PAGES_PER_BLOCK + p
+        return None
+
+    def _wear_evacuate(self, src):
+        """把源块全部有效页迁往更高磨损的可用空白页，提交完整映像后才擦源块。
+
+        与 GC 同一协议：搬迁页先编程、映射在内存中更新，整映像提交记录
+        成功（新映像可见）之后才擦除源块；任何中途掉电只留孤儿页，
+        重挂载恢复到最后已提交映像，逻辑数据不丢。
+        """
+        dev = self._dev
+        src_pages = set(range(src * PAGES_PER_BLOCK, (src + 1) * PAGES_PER_BLOCK))
+        for lpn, ppn in enumerate(self._mapping):
+            if ppn not in src_pages:
+                continue
+            data = dev.read_page(ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK)
+            new_ppn = self._wear_alloc(src)
+            if new_ppn is None:
+                # 防御路径：空间已在调用前预检；此处失败即内部状态错误
+                raise FTLError("磨损均衡目标页在搬迁中途消失，判定为内部状态错误")
+            self._pinned.add(new_ppn)
+            try:
+                self._program(new_ppn, data, purpose="wear-copy")
+            finally:
+                self._pinned.discard(new_ppn)
+            self._mapping[lpn] = new_ppn
+        # 提交页可落在源块之外任何仍可用（未坏、未磨损）的空白页
+        commit_ppn = self._wear_alloc_commit(src)
+        if commit_ppn is None:
+            raise FTLError("磨损均衡提交记录无空白页可写，判定为内部状态错误")
+        self._write_commit(commit_ppn, {}, "wear-commit")
+        dev.erase(src, purpose="wear-erase")
         self._rebuild_view()

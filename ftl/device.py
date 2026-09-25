@@ -40,7 +40,8 @@ class PhysicalAction:
     kind: "program" | "erase"
     block: 块号；page: 页内偏移（erase 时为 None）
     purpose: FTL 传入的用途标注，如 "user-data" / "commit" /
-             "gc-copy" / "gc-commit" / "gc-erase"
+             "gc-copy" / "gc-commit" / "gc-erase" /
+             "wear-copy" / "wear-commit" / "wear-erase"
     """
 
     kind: str
