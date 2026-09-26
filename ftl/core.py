@@ -18,7 +18,9 @@
 from __future__ import annotations
 
 import zlib
+from collections import namedtuple
 
+from . import ecc as _ecc
 from .device import BLOCKS, PAGE_SIZE, PAGES_PER_BLOCK, TOTAL_PAGES, RawNand
 from .errors import (
     BadBlockError,
@@ -38,6 +40,10 @@ _COMMIT_MAGIC = 0xA5
 _SEQ_MAX = 0xFFFFFF  # 24 位序列号空间
 _DEFAULT_GC_BUDGET = 2 * BLOCKS  # 单次写操作默认的 GC 擦除预算
 _MAX_GC_DEPTH = 4 * BLOCKS  # GC 嵌套深度保险上限
+
+# ECC 模式逻辑读结果：status ∈ {"clean", "corrected", "uncorrectable"}；
+# data 为 16 字节用户数据槽（不可纠正时为 None）。
+ECCReadResult = namedtuple("ECCReadResult", ("status", "data"))
 
 
 # ----------------------------------------------------------------------
@@ -93,16 +99,25 @@ class _BlockView:
 
 
 class FTL:
-    """闪存翻译层。挂载即恢复：扫描设备，取最后一条完整提交记录。"""
+    """闪存翻译层。挂载即恢复：扫描设备，取最后一条完整提交记录。
 
-    def __init__(self, device, *, gc_budget=None):
+    ecc=True 启用扩展 Hamming SECDED：每个 8 位数据字独立编码为 13 位
+    码字，一页 32 字节容纳 16 字节用户数据；读出时区分无错/单比特已
+    纠正/双比特不可纠正，已纠正页进入待清洗队列，由 scrub() 经原安全
+    搬迁过程（新页 + 提交记录）写入新页。
+    """
+
+    def __init__(self, device, *, gc_budget=None, ecc=False):
         if not isinstance(device, RawNand):
             raise InvalidInputError(
                 f"device 必须是 RawNand，得到 {type(device).__name__}"
             )
         if device.crashed:
             raise PowerLossError("设备处于掉电冻结态：请先 device.reboot() 再挂载")
+        if not isinstance(ecc, bool):
+            raise InvalidInputError(f"ecc 必须是 bool，得到 {ecc!r}")
         self._dev = device
+        self._ecc = ecc
         self._gc_budget = (
             _DEFAULT_GC_BUDGET
             if gc_budget is None
@@ -115,6 +130,8 @@ class FTL:
         self._pinned: set[int] = set()
         self._view = [_BlockView() for _ in range(BLOCKS)]
         self._gc_spent = 0
+        self._scrub_queue: list[int] = []  # 待清洗物理页（有序、去重）
+        self._scrub_set: set[int] = set()
         self._mount()
 
     # ------------------------------------------------------------------
@@ -175,10 +192,12 @@ class FTL:
     def write(self, lpn, data, *, gc_budget=None):
         """覆盖写逻辑页：新数据页 + 提交记录。失败不改变已提交逻辑映像。
 
+        ECC 模式下 data 上限 16 字节（每 8 位数据字独立编码为 13 位码字）。
         物理层可能留下未提交的孤儿页（属已说明的部分变更，GC 会回收）。
         """
         lpn = require_int("lpn", lpn, 0, LOGICAL_PAGES - 1)
-        data = require_bytes("data", data, min_len=1, max_len=PAGE_SIZE)
+        max_len = _ecc.PAGE_DATA_BYTES if self._ecc else PAGE_SIZE
+        data = require_bytes("data", data, min_len=1, max_len=max_len)
         budget = self._resolve_budget(gc_budget)
         self._gc_spent = 0
         self._rebuild_view()
@@ -186,7 +205,8 @@ class FTL:
             data_ppn = self._ensure_free_page(set(), 0, budget, GC_RESERVE_PAGES)
             self._pinned.add(data_ppn)
             try:
-                self._program(data_ppn, data, purpose="user-data")
+                payload = _ecc.encode_page(data) if self._ecc else data
+                self._program(data_ppn, payload, purpose="user-data")
                 # 提交内容在 _commit_mapping 内部基于最新映射构建：
                 # 提交页分配可能触发 GC 搬迁，预先快照映射会指回已擦除页
                 self._commit_mapping(
@@ -202,17 +222,78 @@ class FTL:
         )
 
     def read(self, lpn):
-        """读逻辑页：返回 32 字节槽（写入数据的前缀，余为 0xFF 填充）；未映射返回 None。"""
+        """读逻辑页。
+
+        非 ECC 模式：返回 32 字节槽（写入数据的前缀，余为 0xFF 填充）；
+        未映射返回 None。
+        ECC 模式：返回 ECCReadResult(status, data)；未映射返回 None。
+        status="corrected" 时该页被加入待清洗队列（重复读不重复排队）。
+        """
         lpn = require_int("lpn", lpn, 0, LOGICAL_PAGES - 1)
         ppn = self._mapping[lpn]
         if ppn == _UNMAPPED:
             self._logical_log.append({"op": "read", "lpn": lpn, "result": "unmapped"})
             return None
-        data = self._dev.read_page(ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK)
+        raw = self._dev.read_page(ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK)
+        if self._ecc:
+            status, data = _ecc.decode_page(raw)
+            if status == _ecc.CORRECTED and ppn not in self._scrub_set:
+                self._scrub_set.add(ppn)
+                self._scrub_queue.append(ppn)
+            self._logical_log.append(
+                {"op": "read", "lpn": lpn, "result": status, "ppn": ppn}
+            )
+            return ECCReadResult(status, data)
         self._logical_log.append(
             {"op": "read", "lpn": lpn, "result": "ok", "ppn": ppn}
         )
-        return data
+        return raw
+
+    def scrub_queue(self):
+        """待清洗队列快照：仍被映射引用的待清洗物理页号（按入队顺序）。"""
+        mapped = {p for p in self._mapping if p != _UNMAPPED}
+        return tuple(p for p in self._scrub_queue if p in mapped)
+
+    def scrub(self, *, gc_budget=None):
+        """清洗待清洗页：把已纠正的数据经原安全搬迁过程写入新页并提交。
+
+        返回 {"scrubbed": n, "unmapped": m, "uncorrectable": k}。
+        断电安全：搬迁经提交记录生效，清洗中断电后映射仍能恢复；
+        待清洗队列本身为内存态，重启后重读受损页会重新入队。
+        """
+        budget = self._resolve_budget(gc_budget)
+        self._gc_spent = 0
+        self._rebuild_view()
+        result = {"scrubbed": 0, "unmapped": 0, "uncorrectable": 0}
+        queued = self._scrub_queue
+        self._scrub_queue = []
+        self._scrub_set = set()
+        for ppn in queued:
+            lpn = next(
+                (l for l, p in enumerate(self._mapping) if p == ppn), None
+            )
+            if lpn is None:
+                result["unmapped"] += 1  # 页已被覆盖写淘汰，无需清洗
+                continue
+            raw = self._dev.read_page(ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK)
+            status, data = _ecc.decode_page(raw)
+            if status == _ecc.CLEAN:
+                continue  # 已无从纠正起的变化（例如被其他路径修复）
+            if status == _ecc.UNCORRECTABLE:
+                result["uncorrectable"] += 1  # 不可纠正：不猜测、不搬迁
+                continue
+            new_ppn = self._ensure_free_page(set(), 0, budget, 0)
+            self._pinned.add(new_ppn)
+            try:
+                self._program(new_ppn, _ecc.encode_page(data), purpose="scrub-copy")
+                self._commit_mapping(
+                    {lpn: new_ppn}, set(), 0, budget, 0, purpose="scrub-commit"
+                )
+            finally:
+                self._pinned.discard(new_ppn)
+            result["scrubbed"] += 1
+        self._logical_log.append({"op": "scrub", **result})
+        return result
 
     def gc_collect(self, *, gc_budget=None):
         """手动垃圾整理：在预算内回收所有可回收块，返回成功擦除的块数。"""
@@ -231,8 +312,10 @@ class FTL:
         self._rebuild_view()
         dev = self._dev
         return {
+            "ecc": self._ecc,
             "logical_pages": LOGICAL_PAGES,
             "mapped_pages": sum(1 for p in self._mapping if p != _UNMAPPED),
+            "scrub_pending_pages": len(self.scrub_queue()),
             "free_physical_pages": self._total_blanks(),
             "gc_reserved_pages": GC_RESERVE_PAGES,
             "reclaimable_dead_pages": sum(v.dead for v in self._view),

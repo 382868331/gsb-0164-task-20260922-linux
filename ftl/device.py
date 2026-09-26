@@ -176,6 +176,30 @@ class RawNand:
     # ------------------------------------------------------------------
     # 坏块管理
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 合成故障注入（测试/演示线束，非物理动作、不计日志）
+    # ------------------------------------------------------------------
+    def inject_bit_flip(self, block, page, bit_index):
+        """对已编程页做一次合成位翻转（模拟闪存位错误，仅用于测试/演示）。
+
+        这不是物理动作：不追加动作日志、不触发崩溃计划、不修改擦除计数；
+        只翻转指定页内第 bit_index 位（0..255，按字节序小端位号）。
+        空白页拒绝注入（无可损坏的数据）。
+        """
+        self._check_open()
+        block = require_int("block", block, 0, BLOCKS - 1)
+        page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
+        bit_index = require_int("bit_index", bit_index, 0, PAGE_SIZE * 8 - 1)
+        if self._bad[block]:
+            raise BadBlockError(f"块 {block} 是坏块，禁止注入位翻转")
+        cell = self._cells[block * PAGES_PER_BLOCK + page]
+        if all(b == BLANK_BYTE for b in cell):
+            raise InvalidInputError("空白页无数据可损坏，拒绝注入位翻转")
+        cell[bit_index // 8] ^= 1 << (bit_index % 8)
+
+    # ------------------------------------------------------------------
+    # 坏块管理
+    # ------------------------------------------------------------------
     def mark_factory_bad(self, block):
         """登记工厂坏块：仅允许对从未使用（零擦除、全空白）的块登记。"""
         self._check_open()

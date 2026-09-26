@@ -2,12 +2,15 @@
 
 公开接口：
 - 设备：RawNand, PhysicalAction 及几何常量 BLOCKS/PAGES_PER_BLOCK/PAGE_SIZE
-- 核心：FTL, LOGICAL_PAGES, encode_commit_record, decode_commit_record
+- 核心：FTL, ECCReadResult, LOGICAL_PAGES, encode_commit_record, decode_commit_record
+- 校验：ecc 子模块（扩展 Hamming SECDED，每个 8 位数据字独立编码）
 - 校验：require_int, require_bytes, require_finite_number
 - 错误：FTLError 及其子类（见 ftl.errors 文档）
 """
+from . import ecc
 from .core import (
     FTL,
+    ECCReadResult,
     GC_RESERVE_PAGES,
     LOGICAL_PAGES,
     decode_commit_record,
@@ -34,6 +37,8 @@ from .validation import require_bytes, require_finite_number, require_int
 
 __all__ = [
     "FTL",
+    "ECCReadResult",
+    "ecc",
     "RawNand",
     "PhysicalAction",
     "LOGICAL_PAGES",

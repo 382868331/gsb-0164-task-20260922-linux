@@ -1,9 +1,12 @@
-# ftl — 合成闪存翻译层：断电搬迁与磨损管理
+# ftl — 合成闪存翻译层：断电搬迁、磨损管理与 SECDED 页校验
 
 面向离线嵌入式存储工程的可复用合成 FTL（flash translation layer）模块：
 逻辑页覆盖写采用“新页 + 带 CRC32 的映射提交记录”，掉电可发生在每次
 页写/擦除之后；恢复时按序列号选择最后一条完整提交记录；垃圾整理先搬迁
-仍有效的页再擦块；磨损上限由输入给定；坏块永不再分配。
+仍有效的页再擦块；磨损上限由输入给定；坏块永不再分配。本轮新增：
+页读写链上可选的扩展 Hamming SECDED 校验（每个 8 位数据字独立编码），
+读出区分无错/单比特已纠正/双比特不可纠正，已纠正页进入待清洗队列，
+清洗经原安全搬迁过程写入新页。
 
 ## 环境与运行
 
@@ -14,8 +17,10 @@
 - 示例数据由仓库内确定性代码生成，无外部附件。
 
 ```bash
+python -m venv .venv && source .venv/bin/activate   # 准备虚拟环境（可选但推荐）
 python -m unittest discover -s tests -v   # 运行全部测试（约 1 秒）
 python demo.py                            # 固定输入演示（约 1 秒内完成）
+python demo_iteration.py                  # 本轮 SECDED 演示（约 1 秒内完成）
 ```
 
 ## 设备几何与持久格式（固定契约）
@@ -57,18 +62,52 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 - 查询：`action_log()`（物理动作日志）、`erase_count(b)`、
   `is_bad_block(b)`、`bad_blocks()`、`max_erases`、`crashed`。
 
-### `ftl.FTL(device, *, gc_budget=None)` — 翻译层（挂载即恢复）
+### `ftl.FTL(device, *, gc_budget=None, ecc=False)` — 翻译层（挂载即恢复）
 
 - `write(lpn, data, *, gc_budget=None)`：覆盖写逻辑页
   （新数据页 + 提交记录）。`gc_budget` 可覆盖本次操作的 GC 擦除预算。
-- `read(lpn)`：返回 32 字节槽（写入数据为前缀，余为 `0xFF` 填充）；
+  ECC 模式下 `data` 上限为 16 字节（见下节）。
+- `read(lpn)`：非 ECC 模式返回 32 字节槽（写入数据为前缀，余为
+  `0xFF` 填充）；未映射返回 `None`。ECC 模式返回 `ECCReadResult`，
   未映射返回 `None`。
+- `scrub_queue()`：待清洗队列快照（仍被映射引用的物理页号，按入队序）。
+- `scrub(*, gc_budget=None)`：清洗待清洗页——把已纠正的数据经原安全
+  搬迁过程（新页 + 提交记录，purpose 为 `scrub-copy`/`scrub-commit`）
+  写入新页；返回 `{"scrubbed": n, "unmapped": m, "uncorrectable": k}`。
 - `gc_collect(*, gc_budget=None)`：手动垃圾整理，返回擦除的块数。
 - `capacity()`：剩余容量/磨损快照（`free_physical_pages`、
   `reclaimable_dead_pages`、`gc_reserved_pages`、`bad_blocks`、
-  `worn_blocks`、`erase_counts`、`commit_seq` 等，全为精确整数）。
+  `worn_blocks`、`erase_counts`、`commit_seq`、`ecc`、
+  `scrub_pending_pages` 等，全为精确整数）。
 - `logical_log()`：逻辑读写日志；`physical_log()`：物理动作日志；
   `mapping_snapshot()`、`commit_seq`、`device`。
+
+### 扩展 Hamming SECDED 页校验（`ecc=True`，`ftl.ecc` 子模块）
+
+- 每个 **8 位数据字独立编码**为 13 位扩展 Hamming 码字：位 1/2/4/8
+  为 Hamming 偶校验位，位 13 为覆盖位 1..12 的整体偶校验位，数据位
+  依次放在位 3,5,6,7,9,10,11,12。码字按小端存 2 字节（高 3 位恒零），
+  一页 32 字节恰好容纳 **16 字节用户数据**（不足以 `0xFF` 填充后编码）。
+- 读出分类（独立校验方程：综合校验子 S = 位 1..12 中为 1 的位号异或，
+  整体奇偶 P = 全部 13 位奇偶）：
+  - `P=0, S=0` → `clean`（无错）；
+  - `P=1, S≠0` → `corrected`（位 S 单比特翻转，含数据位与校验位）；
+  - `P=1, S=0` → `corrected`（整体校验位自身翻转，数据不变）；
+  - `P=0, S≠0` → `uncorrectable`（双比特错误，**绝不改成看似合法的
+    数据**，`data` 返回 `None`）。
+- `read` 返回 `ECCReadResult(status, data)`：`status` 为
+  `clean`/`corrected`/`uncorrectable`，`data` 为 16 字节槽
+  （不可纠正时为 `None`）。`corrected` 页自动加入待清洗队列；
+  **重复读同一待清洗页不重复排队**；不可纠正页不入队。
+- `scrub()` 清洗经提交记录生效，**清洗中断电后映射仍能恢复**（重启
+  重新挂载即可）；待清洗队列为内存态，重启后重读受损页会重新入队。
+- 校验正确但映射世代过期的页（被覆盖写淘汰的旧数据页）**不会被救活**：
+  读路径只按当前映射取页，恢复只认序列号最大的完整提交记录。
+- `ftl.ecc` 公开：`encode_word`/`decode_word`/`classify`/`syndrome`/
+  `encode_page`/`decode_page`/`flip_bit` 及常量 `PAGE_DATA_BYTES=16`。
+- 合成位翻转线束：`RawNand.inject_bit_flip(block, page, bit_index)`
+  对已编程页翻转一位（非物理动作、不计日志），仅用于测试/演示，
+  不访问真实磁盘。
 
 ### 校验助手
 
@@ -82,8 +121,10 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 |---|---|
 | `max_erases` | int，0..2³¹−1（拒绝 bool/浮点；0 表示禁止任何擦除） |
 | `lpn` | int，0..23 |
-| `data` | bytes-like，1..32 字节 |
+| `data` | bytes-like，1..32 字节（ECC 模式 1..16 字节） |
 | `gc_budget` | int，0..2³¹−1（默认 32 = 2×块数） |
+| `ecc` | bool（默认 False，拒绝非 bool） |
+| `bit_index`（位翻转注入） | int，0..255 |
 | `crash_plan` 元素 | int，≥1 |
 | `block` / `page` | 0..15 / 0..7 |
 | 提交序列号 | 0..16777215（24 位），耗尽抛 `FTLError` |
@@ -132,6 +173,11 @@ python demo.py                            # 固定输入演示（约 1 秒内完
   提交记录（误判概率约 2⁻³²），本模块不防御恶意写入者。
 - `read` 返回 32 字节物理槽（写入数据为前缀、`0xFF` 填充），不记录
   原始写入长度；调用方需自行约定长度编码。
+- ECC 模式每页用户数据降为 16 字节（每 8 位数据字独立占 2 字节存储）；
+  提交记录本身仍由 magic+CRC32+结构校验保护，不做 SECDED 编码。
+- SECDED 只保证单比特可纠、双比特可检；三比特及以上错误可能误判
+  （扩展 Hamming 码的固有性质），本模块不建模更多位错误。
+- 待清洗队列为内存态，不持久化；重启后需重读受损页重新发现。
 - 提交序列号上限 16777215 次，耗尽后写操作抛 `FTLError`。
 - 磨损上限只约束擦除次数，不建模编程/读取干扰等真实磨损源。
 - 单线程、无并发；掉电不建模页写/擦除中途的撕裂页（动作内原子）。
@@ -151,6 +197,10 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 - `test_badblock_wear_space.py`：坏块不再分配、磨损极限、
   空间不足与预算耗尽的区分、失败无逻辑部分变更。
 - `test_records.py`：残缺/伪造/过期提交记录不得生效。
+- `test_ecc.py`：本轮新增——小数据字枚举全部 13 个单错位置与 78 对
+  双错位置，分类期望值由测试内独立复现的校验方程给出；纠正读入队与
+  去重、校验位自身翻转识别、清洗搬迁、清洗中断电恢复、世代过期页不
+  被救活、旧无故障写读一致。
 
 独立参考：`tests/refimg.py` 不调用 FTL 核心算法——它仅用设备只读
 接口扫描物理页，独立复现“提交记录解析 + 序列号仲裁”来重建期望映像；
