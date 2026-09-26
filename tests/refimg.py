@@ -8,6 +8,8 @@
 """
 import zlib
 
+from ftl.errors import PageUnreadableError
+
 BLOCKS = 16
 PAGES_PER_BLOCK = 8
 PAGE_SIZE = 32
@@ -40,7 +42,11 @@ def parse_committed_image(dev):
         if dev.is_bad_block(b):
             continue
         for p in range(PAGES_PER_BLOCK):
-            rec = _parse_record(dev.read_page(b, p), b * PAGES_PER_BLOCK + p)
+            try:
+                raw = dev.read_page(b, p)
+            except PageUnreadableError:
+                continue  # 损坏页不可能是可用的提交记录
+            rec = _parse_record(raw, b * PAGES_PER_BLOCK + p)
             if rec is None:
                 continue
             seq, mapping = rec
@@ -51,7 +57,11 @@ def parse_committed_image(dev):
     if best is not None:
         for lpn, ppn in enumerate(best[2]):
             if ppn != UNMAPPED:
-                image[lpn] = dev.read_page(ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK)
+                b, p = ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK
+                if dev.is_bad_block(b) or dev.is_unreadable_page(b, p):
+                    image[lpn] = None  # 已不可恢复：参考侧同样拒绝伪造内容
+                else:
+                    image[lpn] = dev.read_page(b, p)
     return image
 
 

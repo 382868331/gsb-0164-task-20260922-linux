@@ -20,7 +20,9 @@ from dataclasses import dataclass
 from .errors import (
     BadBlockError,
     BlockWornError,
+    EraseFailureError,
     InvalidInputError,
+    PageUnreadableError,
     PowerLossError,
 )
 from .validation import INT_CAP, require_bytes, require_int
@@ -57,6 +59,8 @@ class RawNand:
         self._cells = [bytearray(BLANK_PAGE) for _ in range(TOTAL_PAGES)]
         self._erase_counts = [0] * BLOCKS
         self._bad = [False] * BLOCKS
+        self._erase_failing: set[int] = set()  # 注入故障：不可再擦写（可读）
+        self._unreadable: set[int] = set()  # 注入故障：物理页号已不可读
         self._log: list[PhysicalAction] = []
         self._crash_plan: list[int] | None = None
         self.set_crash_plan(crash_plan)
@@ -144,6 +148,10 @@ class RawNand:
             raise InvalidInputError(f"purpose 必须是 str，得到 {purpose!r}")
         if self._bad[block]:
             raise BadBlockError(f"块 {block} 是坏块，禁止擦除")
+        if block in self._erase_failing:
+            raise EraseFailureError(
+                f"块 {block} 已不可再擦写（注入故障），但仍可读取"
+            )
         if self._erase_counts[block] >= self._max_erases:
             raise BlockWornError(
                 f"块 {block} 擦除次数已达磨损上限 {self._max_erases}，拒绝擦除"
@@ -162,6 +170,9 @@ class RawNand:
         page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
         if self._bad[block]:
             raise BadBlockError(f"块 {block} 是坏块，禁止读取")
+        ppn = block * PAGES_PER_BLOCK + page
+        if ppn in self._unreadable:
+            raise PageUnreadableError(f"物理页 {ppn} 已损坏不可读（注入故障）")
         return bytes(self._cells[block * PAGES_PER_BLOCK + page])
 
     def is_blank(self, block, page):
@@ -200,6 +211,33 @@ class RawNand:
         self._bad[block] = True
 
     # ------------------------------------------------------------------
+    # 硬件故障注入（测试/演示线束；故障为永久性，reboot 后仍然有效）
+    # ------------------------------------------------------------------
+    def inject_erase_failure(self, block):
+        """注入故障：块从此不可再擦写（erase 抛 EraseFailureError），但仍可读。"""
+        self._check_open()
+        block = require_int("block", block, 0, BLOCKS - 1)
+        if self._bad[block]:
+            raise InvalidInputError(f"块 {block} 已是坏块，无需注入擦写故障")
+        self._erase_failing.add(block)
+
+    def inject_unreadable_page(self, block, page):
+        """注入故障：指定物理页从此不可读（read_page 抛 PageUnreadableError）。"""
+        self._check_open()
+        block = require_int("block", block, 0, BLOCKS - 1)
+        page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
+        self._unreadable.add(block * PAGES_PER_BLOCK + page)
+
+    def is_erase_failing(self, block):
+        block = require_int("block", block, 0, BLOCKS - 1)
+        return block in self._erase_failing
+
+    def is_unreadable_page(self, block, page):
+        block = require_int("block", block, 0, BLOCKS - 1)
+        page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
+        return block * PAGES_PER_BLOCK + page in self._unreadable
+
+    # ------------------------------------------------------------------
     # 状态查询
     # ------------------------------------------------------------------
     @property
@@ -230,19 +268,30 @@ class RawNand:
             "cells": [bytes(c) for c in self._cells],
             "erase_counts": list(self._erase_counts),
             "bad": list(self._bad),
+            "erase_failing": sorted(self._erase_failing),
+            "unreadable": sorted(self._unreadable),
             "log": list(self._log),
             "plan": None if self._crash_plan is None else list(self._crash_plan),
         }
 
     def restore(self, snap):
         """恢复到 snapshot() 保存的状态；清除冻结与武装状态。"""
-        if not isinstance(snap, dict) or any(
-            k not in snap for k in ("cells", "erase_counts", "bad", "log", "plan")
-        ):
+        required = (
+            "cells",
+            "erase_counts",
+            "bad",
+            "erase_failing",
+            "unreadable",
+            "log",
+            "plan",
+        )
+        if not isinstance(snap, dict) or any(k not in snap for k in required):
             raise InvalidInputError("restore() 需要 snapshot() 返回的状态字典")
         self._cells = [bytearray(c) for c in snap["cells"]]
         self._erase_counts = list(snap["erase_counts"])
         self._bad = list(snap["bad"])
+        self._erase_failing = set(snap["erase_failing"])
+        self._unreadable = set(snap["unreadable"])
         self._log = list(snap["log"])
         self._crash_plan = None if snap["plan"] is None else list(snap["plan"])
         self._crashed = False

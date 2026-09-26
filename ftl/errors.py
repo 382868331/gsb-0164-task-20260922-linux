@@ -11,8 +11,12 @@
 - ``GCBudgetExhaustedError``：垃圾整理的擦除预算耗尽。与
   ``OutOfSpaceError`` 严格区分：此时仍存在可回收块，只是本次操作的
   预算不允许继续。
-- ``BadBlockError``：对坏块的读/写/擦除尝试；坏块永不再分配。
-- ``BlockWornError``：块的擦除次数达到输入给定的磨损上限。
+ - ``BadBlockError``：对坏块的读/写/擦除尝试；坏块永不再分配。
+ - ``BlockWornError``：块的擦除次数达到输入给定的磨损上限。
+ - ``EraseFailureError``：注入的硬件故障——块不可再擦写（但仍可读）。
+ - ``PageUnreadableError``：注入的硬件故障——指定物理页已不可读。
+ - ``DataLossError``：逻辑页数据已不可恢复（所在块已退役或物理页
+   不可读）；模块绝不凭空伪造内容，读取一律显式报错。
 """
 
 
@@ -42,3 +46,15 @@ class BadBlockError(FTLError):
 
 class BlockWornError(FTLError):
     """磨损极限：块的擦除次数已达输入给定的上限。"""
+
+
+class EraseFailureError(FTLError):
+    """擦写失败：块已不可再擦写（注入的硬件故障），但仍可读取。"""
+
+
+class PageUnreadableError(FTLError):
+    """页不可读：指定物理页已损坏（注入的硬件故障），禁止读取。"""
+
+
+class DataLossError(FTLError):
+    """数据丢失：逻辑页内容已不可恢复，拒绝返回任何伪造内容。"""

@@ -14,6 +14,10 @@
   搬迁（最多 7 个有效页 + 1 条提交记录）总能容纳；保留页不可被用户写耗尽。
 - 分配按（擦除次数升序, 空白页数降序, 块号升序）选块，实现静态磨损均衡；
   坏块与磨损块（擦除次数达上限）永不分配、永不作为整理对象。
+- 块退役（retire_block）：把仍可读的有效页搬到其他好块并写入新提交
+  记录，提交落稳后才把块标记为坏块；此前旧映射始终有效。含不可读页
+  时如实报告受损逻辑页（绝不伪造数据），其映射项保留指向原物理页，
+  读取抛 DataLossError。搬迁空间不足时不标坏块、不改已提交映像。
 """
 from __future__ import annotations
 
@@ -23,10 +27,13 @@ from .device import BLOCKS, PAGE_SIZE, PAGES_PER_BLOCK, TOTAL_PAGES, RawNand
 from .errors import (
     BadBlockError,
     BlockWornError,
+    DataLossError,
+    EraseFailureError,
     FTLError,
     GCBudgetExhaustedError,
     InvalidInputError,
     OutOfSpaceError,
+    PageUnreadableError,
     PowerLossError,
 )
 from .validation import INT_CAP, require_bytes, require_int
@@ -126,7 +133,10 @@ class FTL:
             if self._dev.is_bad_block(b):
                 continue
             for p in range(PAGES_PER_BLOCK):
-                raw = self._dev.read_page(b, p)
+                try:
+                    raw = self._dev.read_page(b, p)
+                except PageUnreadableError:
+                    continue  # 损坏页不可能是可用的提交记录
                 if raw[0] != _COMMIT_MAGIC:
                     continue
                 rec = decode_commit_record(raw)
@@ -208,11 +218,90 @@ class FTL:
         if ppn == _UNMAPPED:
             self._logical_log.append({"op": "read", "lpn": lpn, "result": "unmapped"})
             return None
-        data = self._dev.read_page(ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK)
+        try:
+            data = self._dev.read_page(ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK)
+        except (BadBlockError, PageUnreadableError) as e:
+            self._logical_log.append({"op": "read", "lpn": lpn, "result": "data-loss"})
+            raise DataLossError(
+                f"逻辑页 {lpn} 的数据已不可恢复（{e}）；拒绝返回伪造内容"
+            ) from e
         self._logical_log.append(
             {"op": "read", "lpn": lpn, "result": "ok", "ppn": ppn}
         )
         return data
+
+    def retire_block(self, block, *, gc_budget=None):
+        """退役物理块：搬走仍可读的有效页后永久停用该块。
+
+        流程：逐个读出块内当前映射引用的有效页并写入他处（旧映射在此
+        期间始终有效）→ 写入一条新提交记录落稳新映射 → 最后才把块标记
+        为坏块。返回 {"block", "moved", "damaged"}：
+
+        - moved: {lpn: 新物理页号}，成功搬迁的逻辑页；
+        - damaged: 元组，因物理页不可读而无法恢复的逻辑页（其映射项
+          保留指向原页，读取抛 DataLossError，绝不伪造内容）。
+
+        空间/预算不足时抛 OutOfSpaceError / GCBudgetExhaustedError：
+        块不被标记为坏块、已提交逻辑映像不变（物理层可能留下未提交的
+        孤儿搬迁副本，属已说明的部分变更，GC 会回收）。
+        """
+        block = require_int("block", block, 0, BLOCKS - 1)
+        if self._dev.is_bad_block(block):
+            raise BadBlockError(f"块 {block} 已是坏块，无需退役")
+        budget = self._resolve_budget(gc_budget)
+        self._gc_spent = 0
+        self._rebuild_view()
+        base = block * PAGES_PER_BLOCK
+        victim_pages = set(range(base, base + PAGES_PER_BLOCK))
+        exclude = {block}
+        updates = {}
+        damaged = []
+        for lpn, ppn in enumerate(self._mapping):
+            if ppn not in victim_pages:
+                continue
+            try:
+                data = self._dev.read_page(ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK)
+            except PageUnreadableError:
+                damaged.append(lpn)  # 不能凭空恢复：如实报告，映射保持指向原页
+                continue
+            new_ppn = self._ensure_free_page(exclude, 0, budget, 0)
+            self._pinned.add(new_ppn)
+            try:
+                self._program(new_ppn, data, purpose="retire-copy")
+            finally:
+                self._pinned.discard(new_ppn)
+            updates[lpn] = new_ppn
+        # 新提交记录落稳前，旧映射（含旧提交记录）始终有效；
+        # 若本块持有当前最新提交记录，即使无需搬迁也必须先提交新记录，
+        # 否则标坏后挂载扫描会跳过本块、映射发生回退。
+        if updates or damaged or self._commit_ppn in victim_pages:
+            self._commit_mapping(updates, exclude, 0, budget, 0, purpose="retire-commit")
+        self._dev.retire_block(block)
+        self._rebuild_view()
+        self._logical_log.append(
+            {
+                "op": "retire",
+                "block": block,
+                "moved": len(updates),
+                "damaged": list(damaged),
+            }
+        )
+        return {
+            "block": block,
+            "moved": dict(updates),
+            "damaged": tuple(damaged),
+        }
+
+    def damaged_pages(self):
+        """当前已不可恢复的逻辑页（映射指向坏块或不可读物理页），升序元组。"""
+        out = []
+        for lpn, ppn in enumerate(self._mapping):
+            if ppn == _UNMAPPED:
+                continue
+            b, p = divmod(ppn, PAGES_PER_BLOCK)
+            if self._dev.is_bad_block(b) or self._dev.is_unreadable_page(b, p):
+                out.append(lpn)
+        return tuple(out)
 
     def gc_collect(self, *, gc_budget=None):
         """手动垃圾整理：在预算内回收所有可回收块，返回成功擦除的块数。"""
@@ -237,6 +326,7 @@ class FTL:
             "gc_reserved_pages": GC_RESERVE_PAGES,
             "reclaimable_dead_pages": sum(v.dead for v in self._view),
             "bad_blocks": dev.bad_blocks(),
+            "damaged_pages": self.damaged_pages(),
             "worn_blocks": tuple(
                 b
                 for b in range(BLOCKS)
@@ -390,6 +480,11 @@ class FTL:
             )
         try:
             self._dev.erase(victim, purpose="gc-erase")
+        except EraseFailureError:
+            # 擦写失败（注入故障）：有效页已在上面搬完并提交，直接退役该块
+            self._dev.retire_block(victim)
+            self._rebuild_view()
+            return
         except BlockWornError:
             # 防御路径（正常受害块筛选已排除磨损块）：退役该块，永不再用
             self._dev.retire_block(victim)

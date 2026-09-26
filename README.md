@@ -16,6 +16,13 @@
 ```bash
 python -m unittest discover -s tests -v   # 运行全部测试（约 1 秒）
 python demo.py                            # 固定输入演示（约 1 秒内完成）
+python demo_iteration.py                  # 本轮迭代演示：块报废退役（约 1 秒内完成）
+```
+
+venv 准备（可选，仓库根目录已提供 .venv 符号链接时无需重复）：
+
+```bash
+python3.14 -m venv .venv && . .venv/bin/activate   # 仅为隔离环境；无任何第三方依赖
 ```
 
 ## 设备几何与持久格式（固定契约）
@@ -50,6 +57,12 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 - `read_page(block, page)` / `is_blank(block, page)`。
 - `mark_factory_bad(block)`：登记工厂坏块（仅限未使用的空白块）。
 - `retire_block(block)`：运行时退役为坏块（幂等）。
+- `inject_erase_failure(block)` / `inject_unreadable_page(block, page)`：
+  注入永久性硬件故障（测试/演示线束）——前者使块不可再擦写
+  （`erase` 抛 `EraseFailureError`，但仍可读），后者使指定物理页不可读
+  （`read_page` 抛 `PageUnreadableError`）。故障跨 `reboot()` 保持，
+  并纳入 `snapshot()`/`restore()`。
+- `is_erase_failing(b)` / `is_unreadable_page(b, p)`：故障状态查询。
 - `reboot()`：模拟重新上电（内容/计数/坏块/日志保留，清除冻结态）。
 - `set_crash_plan([k, ...])` + `arm_crash()`：崩溃注入线束——
   每完成 k 次物理动作后掉电一次；`snapshot()`/`restore()` 支持
@@ -64,9 +77,22 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 - `read(lpn)`：返回 32 字节槽（写入数据为前缀，余为 `0xFF` 填充）；
   未映射返回 `None`。
 - `gc_collect(*, gc_budget=None)`：手动垃圾整理，返回擦除的块数。
+- `retire_block(block, *, gc_budget=None)`：**块报废退役**——把块内仍
+  可读的有效页搬到其他好块，写入新提交记录落稳后才把块永久标坏；
+  在此之前旧映射始终有效。返回
+  `{"block", "moved": {lpn: 新物理页}, "damaged": (受损 lpn, ...)}`。
+  块内不可读页对应的逻辑页被如实列入 `damaged`（绝不伪造数据，其
+  映射项保留指向原页，读取抛 `DataLossError`）。空间/预算不足时抛
+  `OutOfSpaceError` / `GCBudgetExhaustedError`，块**不会**被提前标坏、
+  已提交逻辑映像不变（物理层可能留下未提交的孤儿搬迁副本，GC 会回收）。
+  坏块从此不再进入分配与 GC 候选。GC 擦除遇到注入的擦写故障
+  （`EraseFailureError`）时也会自动走同一退役路径。
+- `damaged_pages()`：当前已不可恢复的逻辑页（映射指向坏块或不可读
+  物理页），升序元组；重启后由映射与坏块集合重新推导，结果持久一致。
 - `capacity()`：剩余容量/磨损快照（`free_physical_pages`、
   `reclaimable_dead_pages`、`gc_reserved_pages`、`bad_blocks`、
-  `worn_blocks`、`erase_counts`、`commit_seq` 等，全为精确整数）。
+  `damaged_pages`、`worn_blocks`、`erase_counts`、`commit_seq` 等，
+  全为精确整数）。
 - `logical_log()`：逻辑读写日志；`physical_log()`：物理动作日志；
   `mapping_snapshot()`、`commit_seq`、`device`。
 
@@ -98,6 +124,9 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 | `GCBudgetExhaustedError` | **预算耗尽**：仍有可回收块，但本次操作预算不允许继续 |
 | `BadBlockError` | 对坏块的读/写/擦除尝试 |
 | `BlockWornError` | 块擦除次数达到 `max_erases` |
+| `EraseFailureError` | 注入故障：块不可再擦写（仍可读） |
+| `PageUnreadableError` | 注入故障：指定物理页已不可读 |
+| `DataLossError` | 逻辑页数据已不可恢复，读取拒绝返回伪造内容 |
 
 预算耗尽与证明无解严格分开：`gc_budget=0` 且存在死页时写操作抛
 `GCBudgetExhaustedError`；`max_erases=0`（死页永不可回收）时抛
@@ -151,6 +180,11 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 - `test_badblock_wear_space.py`：坏块不再分配、磨损极限、
   空间不足与预算耗尽的区分、失败无逻辑部分变更。
 - `test_records.py`：残缺/伪造/过期提交记录不得生效。
+- `test_retire.py`：本轮新增——块退役搬迁成功且数据零损失、坏块不再
+  进入分配/GC、**枚举退役过程每个物理动作后的断电点**重放核对、
+  不可读页如实报告受损逻辑页（重启后仍不伪造内容）、空间不足时保留
+  可恢复原状态、GC 遇擦写故障自动退役。真值来自测试侧独立 shadow
+  字典与 `refimg.py` 独立解析器，不调用被测核心得到期望值。
 
 独立参考：`tests/refimg.py` 不调用 FTL 核心算法——它仅用设备只读
 接口扫描物理页，独立复现“提交记录解析 + 序列号仲裁”来重建期望映像；
