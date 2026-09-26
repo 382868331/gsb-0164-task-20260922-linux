@@ -20,6 +20,7 @@ from __future__ import annotations
 import zlib
 
 from .device import BLOCKS, PAGE_SIZE, PAGES_PER_BLOCK, TOTAL_PAGES, RawNand
+from .ecc import CLEAN, CORRECTED, UNCORRECTABLE, decode_page, encode_page
 from .errors import (
     BadBlockError,
     BlockWornError,
@@ -28,6 +29,7 @@ from .errors import (
     InvalidInputError,
     OutOfSpaceError,
     PowerLossError,
+    UncorrectableError,
 )
 from .validation import INT_CAP, require_bytes, require_int
 
@@ -113,6 +115,8 @@ class FTL:
         self._commit_ppn: int | None = None  # 最新提交记录所在物理页
         self._logical_log: list[dict] = []
         self._pinned: set[int] = set()
+        self._scrub_queue: list[int] = []  # 待清洗逻辑页（纠正成功后排队）
+        self._scrub_queued: set[int] = set()  # 去重：同页不重复排队
         self._view = [_BlockView() for _ in range(BLOCKS)]
         self._gc_spent = 0
         self._mount()
@@ -186,7 +190,10 @@ class FTL:
             data_ppn = self._ensure_free_page(set(), 0, budget, GC_RESERVE_PAGES)
             self._pinned.add(data_ppn)
             try:
-                self._program(data_ppn, data, purpose="user-data")
+                slot = data.ljust(PAGE_SIZE, b"\xff")
+                self._program(
+                    data_ppn, slot, spare=encode_page(slot), purpose="user-data"
+                )
                 # 提交内容在 _commit_mapping 内部基于最新映射构建：
                 # 提交页分配可能触发 GC 搬迁，预先快照映射会指回已擦除页
                 self._commit_mapping(
@@ -202,17 +209,95 @@ class FTL:
         )
 
     def read(self, lpn):
-        """读逻辑页：返回 32 字节槽（写入数据的前缀，余为 0xFF 填充）；未映射返回 None。"""
+        """读逻辑页：返回 32 字节槽（写入数据的前缀，余为 0xFF 填充）；未映射返回 None。
+
+        SECDED：单比特错（含校验位自身翻转）自动纠正后返回，并把该页
+        加入待清洗队列；双比特错抛 UncorrectableError，绝不返回伪造数据。
+        """
         lpn = require_int("lpn", lpn, 0, LOGICAL_PAGES - 1)
+        status, slot = self._read_decoded(lpn)
+        if status == "unmapped":
+            return None
+        if status == UNCORRECTABLE:
+            raise UncorrectableError(
+                f"逻辑页 {lpn} 存在双比特错，SECDED 不可纠正，数据已损坏"
+            )
+        return slot
+
+    def read_status(self, lpn):
+        """读逻辑页的健康状态，不抛损坏错误：
+        返回 "unmapped" / "ok" / "corrected" / "corrupted"。
+        副作用与 read 一致（纠正成功的页进入待清洗队列）。"""
+        lpn = require_int("lpn", lpn, 0, LOGICAL_PAGES - 1)
+        status, _slot = self._read_decoded(lpn)
+        return {"clean": "ok", UNCORRECTABLE: "corrupted"}.get(status, status)
+
+    def _read_decoded(self, lpn):
+        """读并译码当前映射页，返回 (状态, 槽)。状态为
+        "unmapped" / "clean" / "corrected" / "uncorrectable"。"""
         ppn = self._mapping[lpn]
         if ppn == _UNMAPPED:
             self._logical_log.append({"op": "read", "lpn": lpn, "result": "unmapped"})
-            return None
-        data = self._dev.read_page(ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK)
+            return "unmapped", None
+        block, page = ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK
+        raw = self._dev.read_page(block, page)
+        spare = self._dev.read_spare(block, page)
+        status, slot = decode_page(raw, spare)
+        if status == UNCORRECTABLE:
+            self._logical_log.append(
+                {"op": "read", "lpn": lpn, "result": "corrupted", "ppn": ppn}
+            )
+            return UNCORRECTABLE, None
+        if status == CORRECTED:
+            self._enqueue_scrub(lpn)
         self._logical_log.append(
-            {"op": "read", "lpn": lpn, "result": "ok", "ppn": ppn}
+            {"op": "read", "lpn": lpn, "result": status if status != CLEAN else "ok", "ppn": ppn}
         )
-        return data
+        return status, slot
+
+    # ------------------------------------------------------------------
+    # 待清洗队列：纠正成功的页稍后通过安全搬迁写入新页
+    # ------------------------------------------------------------------
+    def _enqueue_scrub(self, lpn):
+        if lpn in self._scrub_queued:
+            return  # 重复读同一待清洗页不重复排队
+        self._scrub_queued.add(lpn)
+        self._scrub_queue.append(lpn)
+
+    def scrub_pending(self):
+        """待清洗的逻辑页号（按入队顺序，只读副本）。"""
+        return tuple(self._scrub_queue)
+
+    def scrub(self, *, gc_budget=None):
+        """清洗：把待清洗页通过原安全搬迁过程（新数据页 + 提交记录）
+        重写到新物理页，返回成功清洗的页数。
+
+        - 清洗前重新译码：已变干净的页（如被覆盖写）直接出队；
+        - 已不可纠正的页无法清洗（数据已损坏），保留在队列中；
+        - 清洗中途掉电：提交记录协议保证映射可恢复，重启重新挂载后
+          再次读到该页会重新入队。
+        """
+        scrubbed = 0
+        for lpn in list(self._scrub_queue):
+            if self._mapping[lpn] == _UNMAPPED:
+                self._dequeue_scrub(lpn)
+                continue
+            status, slot = self._read_decoded(lpn)
+            if status == CLEAN:
+                self._dequeue_scrub(lpn)
+                continue
+            if status == UNCORRECTABLE:
+                continue  # 数据已损坏，不能改写为看似合法的数据
+            self.write(lpn, slot, gc_budget=gc_budget)
+            self._dequeue_scrub(lpn)
+            scrubbed += 1
+        if scrubbed:
+            self._logical_log.append({"op": "scrub", "scrubbed": scrubbed})
+        return scrubbed
+
+    def _dequeue_scrub(self, lpn):
+        self._scrub_queued.discard(lpn)
+        self._scrub_queue.remove(lpn)
 
     def gc_collect(self, *, gc_budget=None):
         """手动垃圾整理：在预算内回收所有可回收块，返回成功擦除的块数。"""
@@ -274,9 +359,13 @@ class FTL:
             return self._gc_budget
         return require_int("gc_budget", override, 0, INT_CAP)
 
-    def _program(self, ppn, data, *, purpose):
+    def _program(self, ppn, data, *, spare=None, purpose):
         self._dev.program(
-            ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK, data, purpose=purpose
+            ppn // PAGES_PER_BLOCK,
+            ppn % PAGES_PER_BLOCK,
+            data,
+            spare=spare,
+            purpose=purpose,
         )
         self._rebuild_view()
 
@@ -367,11 +456,21 @@ class FTL:
         for lpn, ppn in enumerate(self._mapping):
             if ppn not in victim_pages:
                 continue
-            data = self._dev.read_page(ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK)
+            block, page = ppn // PAGES_PER_BLOCK, ppn % PAGES_PER_BLOCK
+            raw = self._dev.read_page(block, page)
+            spare = self._dev.read_spare(block, page)
+            status, slot = decode_page(raw, spare)
+            if status == UNCORRECTABLE:
+                # 数据已损坏：原样搬迁原始比特（含原校验码），不伪造
+                # 合法数据；读出时仍会明确报告损坏。
+                slot, out_spare = raw, spare
+            else:
+                # 无错或已纠正：写入纠正后的数据并重新生成校验码
+                out_spare = encode_page(slot)
             new_ppn = self._ensure_free_page(exclude | {victim}, depth + 1, budget, 0)
             self._pinned.add(new_ppn)
             try:
-                self._program(new_ppn, data, purpose="gc-copy")
+                self._program(new_ppn, slot, spare=out_spare, purpose="gc-copy")
             finally:
                 self._pinned.discard(new_ppn)
             self._mapping[lpn] = new_ppn

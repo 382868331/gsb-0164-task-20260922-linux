@@ -17,6 +17,7 @@ from .device import (
     BLOCKS,
     PAGE_SIZE,
     PAGES_PER_BLOCK,
+    SPARE_SIZE,
     TOTAL_PAGES,
     PhysicalAction,
     RawNand,
@@ -29,6 +30,7 @@ from .errors import (
     InvalidInputError,
     OutOfSpaceError,
     PowerLossError,
+    UncorrectableError,
 )
 from .validation import require_bytes, require_finite_number, require_int
 
@@ -41,6 +43,7 @@ __all__ = [
     "BLOCKS",
     "PAGES_PER_BLOCK",
     "PAGE_SIZE",
+    "SPARE_SIZE",
     "TOTAL_PAGES",
     "encode_commit_record",
     "decode_commit_record",
@@ -54,4 +57,5 @@ __all__ = [
     "GCBudgetExhaustedError",
     "BadBlockError",
     "BlockWornError",
+    "UncorrectableError",
 ]

@@ -42,3 +42,7 @@ class BadBlockError(FTLError):
 
 class BlockWornError(FTLError):
     """磨损极限：块的擦除次数已达输入给定的上限。"""
+
+
+class UncorrectableError(FTLError):
+    """数据页双比特错：SECDED 不可纠正，明确报告损坏，不返回伪造数据。"""

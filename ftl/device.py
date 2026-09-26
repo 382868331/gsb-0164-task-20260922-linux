@@ -31,6 +31,8 @@ PAGE_SIZE = 32
 TOTAL_PAGES = BLOCKS * PAGES_PER_BLOCK
 BLANK_BYTE = 0xFF
 BLANK_PAGE = bytes([BLANK_BYTE]) * PAGE_SIZE
+SPARE_SIZE = 32  # 每页备用区（OOB）字节数：存放页级 SECDED 校验码
+BLANK_SPARE = bytes([BLANK_BYTE]) * SPARE_SIZE
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,7 @@ class RawNand:
     def __init__(self, max_erases, *, crash_plan=None):
         self._max_erases = require_int("max_erases", max_erases, 0, INT_CAP)
         self._cells = [bytearray(BLANK_PAGE) for _ in range(TOTAL_PAGES)]
+        self._spare_cells = [bytearray(BLANK_SPARE) for _ in range(TOTAL_PAGES)]
         self._erase_counts = [0] * BLOCKS
         self._bad = [False] * BLOCKS
         self._log: list[PhysicalAction] = []
@@ -118,21 +121,32 @@ class RawNand:
     # ------------------------------------------------------------------
     # 物理操作
     # ------------------------------------------------------------------
-    def program(self, block, page, data, *, purpose=""):
-        """编程一页（1..32 字节，不足部分保持 0xFF）。页必须为空白。"""
+    def program(self, block, page, data, *, spare=None, purpose=""):
+        """编程一页（1..32 字节，不足部分保持 0xFF）。页必须为空白。
+
+        spare：可选的备用区内容（0..32 字节，不足部分保持 0xFF），
+        与数据区在同一原子动作内编程。
+        """
         self._check_open()
         block = require_int("block", block, 0, BLOCKS - 1)
         page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
         data = require_bytes("data", data, min_len=1, max_len=PAGE_SIZE)
+        spare = b"" if spare is None else require_bytes(
+            "spare", spare, min_len=0, max_len=SPARE_SIZE
+        )
         if not isinstance(purpose, str):
             raise InvalidInputError(f"purpose 必须是 str，得到 {purpose!r}")
         if self._bad[block]:
             raise BadBlockError(f"块 {block} 是坏块，禁止编程")
         ppn = block * PAGES_PER_BLOCK + page
         cell = self._cells[ppn]
-        if any(b != BLANK_BYTE for b in cell):
+        spare_cell = self._spare_cells[ppn]
+        if any(b != BLANK_BYTE for b in cell) or any(
+            b != BLANK_BYTE for b in spare_cell
+        ):
             raise InvalidInputError(f"物理页 {ppn} 非空白，NAND 页禁止重写")
         cell[: len(data)] = data
+        spare_cell[: len(spare)] = spare
         self._log.append(PhysicalAction("program", block, page, purpose))
         self._after_action()
 
@@ -151,6 +165,7 @@ class RawNand:
         base = block * PAGES_PER_BLOCK
         for i in range(base, base + PAGES_PER_BLOCK):
             self._cells[i] = bytearray(BLANK_PAGE)
+            self._spare_cells[i] = bytearray(BLANK_SPARE)
         self._erase_counts[block] += 1
         self._log.append(PhysicalAction("erase", block, None, purpose))
         self._after_action()
@@ -164,6 +179,15 @@ class RawNand:
             raise BadBlockError(f"块 {block} 是坏块，禁止读取")
         return bytes(self._cells[block * PAGES_PER_BLOCK + page])
 
+    def read_spare(self, block, page):
+        """读取整页备用区（恒返回 32 字节）。坏块抛 BadBlockError。"""
+        self._check_open()
+        block = require_int("block", block, 0, BLOCKS - 1)
+        page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
+        if self._bad[block]:
+            raise BadBlockError(f"块 {block} 是坏块，禁止读取")
+        return bytes(self._spare_cells[block * PAGES_PER_BLOCK + page])
+
     def is_blank(self, block, page):
         """页是否为空白（全 0xFF）。坏块抛 BadBlockError。"""
         self._check_open()
@@ -171,7 +195,32 @@ class RawNand:
         page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
         if self._bad[block]:
             raise BadBlockError(f"块 {block} 是坏块")
-        return all(b == BLANK_BYTE for b in self._cells[block * PAGES_PER_BLOCK + page])
+        ppn = block * PAGES_PER_BLOCK + page
+        return all(b == BLANK_BYTE for b in self._cells[ppn]) and all(
+            b == BLANK_BYTE for b in self._spare_cells[ppn]
+        )
+
+    # ------------------------------------------------------------------
+    # 合成故障注入（仅测试/演示线束使用；非物理动作，不计日志与崩溃计划）
+    # ------------------------------------------------------------------
+    def inject_bit_flip(self, block, page, bit_index, *, area="data"):
+        """合成位翻转：翻转指定页数据区/备用区中的 1 个比特。
+
+        仅用于离线故障注入测试不产生物理动作日志、不触发崩溃计划、
+        不访问任何真实磁盘。area 为 "data"（0..255）或 "spare"（0..255）。
+        """
+        self._check_open()
+        block = require_int("block", block, 0, BLOCKS - 1)
+        page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
+        if area not in ("data", "spare"):
+            raise InvalidInputError(f"area 必须是 'data' 或 'spare'，得到 {area!r}")
+        limit = PAGE_SIZE * 8 if area == "data" else SPARE_SIZE * 8
+        bit_index = require_int("bit_index", bit_index, 0, limit - 1)
+        if self._bad[block]:
+            raise BadBlockError(f"块 {block} 是坏块，禁止注入")
+        ppn = block * PAGES_PER_BLOCK + page
+        cell = self._cells[ppn] if area == "data" else self._spare_cells[ppn]
+        cell[bit_index // 8] ^= 1 << (bit_index % 8)
 
     # ------------------------------------------------------------------
     # 坏块管理
@@ -228,6 +277,7 @@ class RawNand:
         """深拷贝当前设备状态；须与 restore() 配对使用。"""
         return {
             "cells": [bytes(c) for c in self._cells],
+            "spare_cells": [bytes(c) for c in self._spare_cells],
             "erase_counts": list(self._erase_counts),
             "bad": list(self._bad),
             "log": list(self._log),
@@ -237,10 +287,12 @@ class RawNand:
     def restore(self, snap):
         """恢复到 snapshot() 保存的状态；清除冻结与武装状态。"""
         if not isinstance(snap, dict) or any(
-            k not in snap for k in ("cells", "erase_counts", "bad", "log", "plan")
+            k not in snap
+            for k in ("cells", "spare_cells", "erase_counts", "bad", "log", "plan")
         ):
             raise InvalidInputError("restore() 需要 snapshot() 返回的状态字典")
         self._cells = [bytearray(c) for c in snap["cells"]]
+        self._spare_cells = [bytearray(c) for c in snap["spare_cells"]]
         self._erase_counts = list(snap["erase_counts"])
         self._bad = list(snap["bad"])
         self._log = list(snap["log"])
