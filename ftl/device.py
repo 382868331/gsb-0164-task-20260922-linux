@@ -20,8 +20,10 @@ from dataclasses import dataclass
 from .errors import (
     BadBlockError,
     BlockWornError,
+    EraseFailureError,
     InvalidInputError,
     PowerLossError,
+    UnreadablePageError,
 )
 from .validation import INT_CAP, require_bytes, require_int
 
@@ -57,6 +59,12 @@ class RawNand:
         self._cells = [bytearray(BLANK_PAGE) for _ in range(TOTAL_PAGES)]
         self._erase_counts = [0] * BLOCKS
         self._bad = [False] * BLOCKS
+        # 故障注入：块“不可再擦写但可读”（区别于完全不可访问的坏块）
+        self._no_erase = [False] * BLOCKS
+        # 故障注入：指定物理页永久不可读（数据损失，不得伪造内容）
+        self._unreadable = [False] * TOTAL_PAGES
+        # 已确认数据损失的逻辑页号集合（由 FTL 登记，掉电/重启保留）
+        self._lost_lpns: set[int] = set()
         self._log: list[PhysicalAction] = []
         self._crash_plan: list[int] | None = None
         self.set_crash_plan(crash_plan)
@@ -128,6 +136,10 @@ class RawNand:
             raise InvalidInputError(f"purpose 必须是 str，得到 {purpose!r}")
         if self._bad[block]:
             raise BadBlockError(f"块 {block} 是坏块，禁止编程")
+        if self._no_erase[block]:
+            raise EraseFailureError(
+                f"块 {block} 已发生擦写故障（不可再擦写但仍可读），禁止编程"
+            )
         ppn = block * PAGES_PER_BLOCK + page
         cell = self._cells[ppn]
         if any(b != BLANK_BYTE for b in cell):
@@ -144,6 +156,10 @@ class RawNand:
             raise InvalidInputError(f"purpose 必须是 str，得到 {purpose!r}")
         if self._bad[block]:
             raise BadBlockError(f"块 {block} 是坏块，禁止擦除")
+        if self._no_erase[block]:
+            raise EraseFailureError(
+                f"块 {block} 已发生擦写故障（不可再擦写但仍可读），禁止擦除"
+            )
         if self._erase_counts[block] >= self._max_erases:
             raise BlockWornError(
                 f"块 {block} 擦除次数已达磨损上限 {self._max_erases}，拒绝擦除"
@@ -162,7 +178,12 @@ class RawNand:
         page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
         if self._bad[block]:
             raise BadBlockError(f"块 {block} 是坏块，禁止读取")
-        return bytes(self._cells[block * PAGES_PER_BLOCK + page])
+        ppn = block * PAGES_PER_BLOCK + page
+        if self._unreadable[ppn]:
+            raise UnreadablePageError(
+                f"物理页 {ppn}（块 {block} 页 {page}）已不可读：数据永久丢失"
+            )
+        return bytes(self._cells[ppn])
 
     def is_blank(self, block, page):
         """页是否为空白（全 0xFF）。坏块抛 BadBlockError。"""
@@ -171,7 +192,10 @@ class RawNand:
         page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
         if self._bad[block]:
             raise BadBlockError(f"块 {block} 是坏块")
-        return all(b == BLANK_BYTE for b in self._cells[block * PAGES_PER_BLOCK + page])
+        ppn = block * PAGES_PER_BLOCK + page
+        if self._unreadable[ppn]:
+            return False  # 不可读页不得被当作空白页再次分配
+        return all(b == BLANK_BYTE for b in self._cells[ppn])
 
     # ------------------------------------------------------------------
     # 坏块管理
@@ -194,10 +218,62 @@ class RawNand:
         self._bad[block] = True
 
     def retire_block(self, block):
-        """运行时退役：将块标记为坏块（幂等）。调用方须保证块内无有效数据。"""
+        """运行时退役：将块永久标记为坏块（幂等）。
+
+        FTL 路径（``FTL.retire_block``）在调用前已完成有效页搬迁与提交；
+        直接使用设备层时调用方须自行保证块内不再有有效数据。
+        """
         self._check_open()
         block = require_int("block", block, 0, BLOCKS - 1)
         self._bad[block] = True
+
+    # ------------------------------------------------------------------
+    # 本轮新增：故障注入与数据损失登记
+    # ------------------------------------------------------------------
+    def inject_block_erase_failure(self, block):
+        """注入“块不可再擦写但仍可读”故障（幂等）。
+
+        此后该块：拒绝 program/erase（EraseFailureError），read_page 正常，
+        且不会再进入 FTL 的分配与 GC 候选；数据须经 FTL.retire_block
+        搬出后块才永久退役为坏块。已退役坏块调用本方法属非法输入。
+        """
+        self._check_open()
+        block = require_int("block", block, 0, BLOCKS - 1)
+        if self._bad[block]:
+            raise InvalidInputError(f"块 {block} 已是坏块，不能注入擦写故障")
+        self._no_erase[block] = True
+
+    def is_no_erase_block(self, block):
+        """块是否处于“不可再擦写但可读”的注入故障态。"""
+        block = require_int("block", block, 0, BLOCKS - 1)
+        return self._no_erase[block]
+
+    def inject_unreadable_page(self, block, page):
+        """注入指定页永久不可读故障（幂等）。坏块拒绝注入。"""
+        self._check_open()
+        block = require_int("block", block, 0, BLOCKS - 1)
+        page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
+        if self._bad[block]:
+            raise InvalidInputError(f"块 {block} 已是坏块，不接受页故障注入")
+        self._unreadable[block * PAGES_PER_BLOCK + page] = True
+
+    def is_page_unreadable(self, block, page):
+        block = require_int("block", block, 0, BLOCKS - 1)
+        page = require_int("page", page, 0, PAGES_PER_BLOCK - 1)
+        return self._unreadable[block * PAGES_PER_BLOCK + page]
+
+    def mark_logical_lost(self, lpn):
+        """由 FTL 登记一个已确认数据损失的逻辑页（掉电/重启保留）。"""
+        # lpn 范围由调用方（FTL，逻辑页数 24 < 物理页总数 128）负责校验
+        self._lost_lpns.add(lpn)
+
+    def clear_logical_lost(self, lpn):
+        """逻辑页重新写入有效数据后，撤销其损失登记。"""
+        self._lost_lpns.discard(lpn)
+
+    def lost_logical_pages(self):
+        """返回已确认损失的逻辑页号元组（升序）。"""
+        return tuple(sorted(self._lost_lpns))
 
     # ------------------------------------------------------------------
     # 状态查询
@@ -230,19 +306,27 @@ class RawNand:
             "cells": [bytes(c) for c in self._cells],
             "erase_counts": list(self._erase_counts),
             "bad": list(self._bad),
+            "no_erase": list(self._no_erase),
+            "unreadable": list(self._unreadable),
+            "lost_lpns": set(self._lost_lpns),
             "log": list(self._log),
             "plan": None if self._crash_plan is None else list(self._crash_plan),
         }
 
     def restore(self, snap):
         """恢复到 snapshot() 保存的状态；清除冻结与武装状态。"""
-        if not isinstance(snap, dict) or any(
-            k not in snap for k in ("cells", "erase_counts", "bad", "log", "plan")
-        ):
+        required = (
+            "cells", "erase_counts", "bad", "no_erase",
+            "unreadable", "lost_lpns", "log", "plan",
+        )
+        if not isinstance(snap, dict) or any(k not in snap for k in required):
             raise InvalidInputError("restore() 需要 snapshot() 返回的状态字典")
         self._cells = [bytearray(c) for c in snap["cells"]]
         self._erase_counts = list(snap["erase_counts"])
         self._bad = list(snap["bad"])
+        self._no_erase = list(snap["no_erase"])
+        self._unreadable = list(snap["unreadable"])
+        self._lost_lpns = set(snap["lost_lpns"])
         self._log = list(snap["log"])
         self._crash_plan = None if snap["plan"] is None else list(snap["plan"])
         self._crashed = False

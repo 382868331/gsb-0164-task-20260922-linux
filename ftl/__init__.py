@@ -24,11 +24,14 @@ from .device import (
 from .errors import (
     BadBlockError,
     BlockWornError,
+    EraseFailureError,
     FTLError,
     GCBudgetExhaustedError,
     InvalidInputError,
+    LogicalDataLossError,
     OutOfSpaceError,
     PowerLossError,
+    UnreadablePageError,
 )
 from .validation import require_bytes, require_finite_number, require_int
 
@@ -54,4 +57,7 @@ __all__ = [
     "GCBudgetExhaustedError",
     "BadBlockError",
     "BlockWornError",
+    "EraseFailureError",
+    "UnreadablePageError",
+    "LogicalDataLossError",
 ]

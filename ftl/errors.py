@@ -42,3 +42,19 @@ class BadBlockError(FTLError):
 
 class BlockWornError(FTLError):
     """磨损极限：块的擦除次数已达输入给定的上限。"""
+
+
+class EraseFailureError(FTLError):
+    """运行时擦写故障：块仍可读，但禁止再编程/擦除，应走退役流程。
+
+    与 BlockWornError（达到给定磨损上限）语义分开：本异常模拟擦写
+    动作突然失败、必须永久停用该物理块的场景。
+    """
+
+
+class UnreadablePageError(FTLError):
+    """指定物理页已不可读：页内数据永久丢失，任何层都不得伪造内容。"""
+
+
+class LogicalDataLossError(FTLError):
+    """逻辑页数据已确认损失（其最新物理页不可读），读取被显式阻止。"""
