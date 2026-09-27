@@ -13,6 +13,7 @@ PAGES_PER_BLOCK = 8
 PAGE_SIZE = 32
 LOGICAL_PAGES = 24
 MAGIC = 0xA5
+SNAP_MAGIC = 0x5A
 UNMAPPED = 0xFF
 
 
@@ -76,3 +77,72 @@ def assert_matches_reference(case, ftl, dev):
             case.assertIsNone(got, f"lpn={lpn} 应为未映射（参考映像）")
         else:
             case.assertEqual(got, exp, f"lpn={lpn} 与参考映像不符")
+
+
+def _parse_snapshot(raw, self_ppn):
+    """独立解析快照描述符（不复用被测核心）。"""
+    if len(raw) != PAGE_SIZE or raw[0] != SNAP_MAGIC:
+        return None
+    if (zlib.crc32(raw[:28]) & 0xFFFFFFFF) != int.from_bytes(raw[28:32], "little"):
+        return None
+    if any(b != 0xFF for b in raw[11:28]):
+        return None
+    op_seq = int.from_bytes(raw[1:4], "little")
+    op = raw[4]
+    snap_id = int.from_bytes(raw[5:7], "little")
+    cseq = int.from_bytes(raw[7:10], "little")
+    cppn = raw[10]
+    if op_seq == 0 or op not in (0, 1) or self_ppn == cppn:
+        return None
+    if op == 1:
+        if cppn != 0xFF and (cseq == 0 or cppn >= BLOCKS * PAGES_PER_BLOCK):
+            return None
+    elif (cseq, cppn) != (0, 0xFF):
+        return None
+    return op_seq, op, snap_id, cseq, cppn
+
+
+def parse_snapshots(dev):
+    """独立重建存活快照：{snap_id: {lpn: 页内容}}（空映像为 {}）。"""
+    commits = {}  # ppn -> (seq, mapping)
+    best = None
+    for b in range(BLOCKS):
+        if dev.is_bad_block(b):
+            continue
+        for p in range(PAGES_PER_BLOCK):
+            ppn = b * PAGES_PER_BLOCK + p
+            rec = _parse_record(dev.read_page(b, p), ppn)
+            if rec is not None:
+                commits[ppn] = rec
+                if best is None or (rec[0], ppn) > (best[0], best[1]):
+                    best = (rec[0], ppn, rec[1])
+    winners = {}
+    for b in range(BLOCKS):
+        if dev.is_bad_block(b):
+            continue
+        for p in range(PAGES_PER_BLOCK):
+            ppn = b * PAGES_PER_BLOCK + p
+            srec = _parse_snapshot(dev.read_page(b, p), ppn)
+            if srec is None:
+                continue
+            key = (srec[0], ppn)
+            cur = winners.get(srec[2])
+            if cur is None or key > (cur[0][0], cur[0][1]):
+                winners[srec[2]] = (key, srec)
+    out = {}
+    for snap_id, (_, srec) in winners.items():
+        op_seq, op, _, cseq, cppn = srec
+        if op == 0:
+            continue
+        if cppn == 0xFF:
+            out[snap_id] = {}
+            continue
+        hit = commits.get(cppn)
+        if hit is None or hit[0] != cseq:
+            continue
+        image = {}
+        for lpn, dppn in enumerate(hit[1]):
+            if dppn != UNMAPPED:
+                image[lpn] = dev.read_page(dppn // PAGES_PER_BLOCK, dppn % PAGES_PER_BLOCK)
+        out[snap_id] = image
+    return out

@@ -110,7 +110,52 @@ def part_boundary():
             print(f"  非法输入被拒绝 [{label}]: {e}")
 
 
+def part_snapshot():
+    print("=== 快照部分：只读旧版本、GC 保护、删除后释放 ===")
+    dev = RawNand(max_erases=4)
+    ftl = FTL(dev)
+    for i in range(12):
+        ftl.write(i % 6, payload(600 + i))
+    ftl.create_snapshot(1)
+    old = {l: ftl.read_snapshot(1, l) for l in range(6)}
+    print(f"  快照 1 已创建: {ftl.snapshot_info(1)}")
+    for i in range(60):  # 大量覆盖写触发 GC：旧版本必须保留
+        ftl.write(i % 6, payload(700 + i))
+    ftl.gc_collect()
+    ok_old = all(FTL(dev).read_snapshot(1, l) == old[l] for l in range(6))
+    ok_new = all(
+        ftl.read(l) == payload(700 + 54 + (l % 6)).ljust(PAGE_SIZE, b"\xff")
+        for l in range(6)
+    )
+    print(f"  60 次覆盖写+GC 后：快照旧版本完整={ok_old}，当前版本为新内容={ok_new}")
+    show_capacity("快照保留中", ftl)
+    ftl.delete_snapshot(1)
+    print(f"  删除后存活快照={list(ftl.list_snapshots())}，重挂载仍为空={list(FTL(dev).list_snapshots())}")
+
+    # 边界：低磨损上限下，快照钉住全部剩余空间时新写入被明确拒绝
+    dev2 = RawNand(max_erases=1)
+    f2 = FTL(dev2)
+    for i in range(24):
+        f2.write(i, payload(i))
+    f2.create_snapshot(9)
+    kept = {l: f2.read_snapshot(9, l) for l in range(24)}
+    n = 0
+    try:
+        while True:
+            f2.write(n % 24, payload(100 + n))
+            n += 1
+        print("  错误：应触发空间不足")
+    except OutOfSpaceError as e:
+        print(f"  快照占用空间不可回收：第 {n + 1} 次写被拒绝 OutOfSpaceError: {e}")
+    intact = all(FTL(dev2).read_snapshot(9, l) == kept[l] for l in range(24))
+    print(f"  拒绝写入后已提交快照与当前版本仍完整: {intact}")
+    f2.delete_snapshot(9)
+    f2.write(0, b"freed-again")
+    print(f"  删除快照后空间释放并可继续写: {f2.read(0)[:11].decode()!r}")
+
+
 if __name__ == "__main__":
     part_normal()
+    part_snapshot()
     part_boundary()
     print("演示结束。")

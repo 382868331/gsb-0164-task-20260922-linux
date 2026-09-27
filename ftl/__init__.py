@@ -1,8 +1,9 @@
-"""合成闪存翻译层（FTL）：断电安全的页映射、垃圾整理与磨损管理。
+"""合成闪存翻译层（FTL）：只读快照、断电安全的页映射、垃圾整理与磨损管理。
 
 公开接口：
 - 设备：RawNand, PhysicalAction 及几何常量 BLOCKS/PAGES_PER_BLOCK/PAGE_SIZE
-- 核心：FTL, LOGICAL_PAGES, encode_commit_record, decode_commit_record
+- 核心：FTL（含 create/read/delete_snapshot）, LOGICAL_PAGES,
+  encode/decode_commit_record, encode/decode_snapshot_record
 - 校验：require_int, require_bytes, require_finite_number
 - 错误：FTLError 及其子类（见 ftl.errors 文档）
 """
@@ -12,6 +13,8 @@ from .core import (
     LOGICAL_PAGES,
     decode_commit_record,
     encode_commit_record,
+    decode_snapshot_record,
+    encode_snapshot_record,
 )
 from .device import (
     BLOCKS,
@@ -44,6 +47,8 @@ __all__ = [
     "TOTAL_PAGES",
     "encode_commit_record",
     "decode_commit_record",
+    "encode_snapshot_record",
+    "decode_snapshot_record",
     "require_int",
     "require_bytes",
     "require_finite_number",
