@@ -12,6 +12,10 @@ from .core import (
     LOGICAL_PAGES,
     decode_commit_record,
     encode_commit_record,
+    decode_snapshot_record,
+    decode_tombstone_record,
+    encode_snapshot_record,
+    encode_tombstone_record,
 )
 from .device import (
     BLOCKS,
@@ -44,6 +48,10 @@ __all__ = [
     "TOTAL_PAGES",
     "encode_commit_record",
     "decode_commit_record",
+    "encode_snapshot_record",
+    "decode_snapshot_record",
+    "encode_tombstone_record",
+    "decode_tombstone_record",
     "require_int",
     "require_bytes",
     "require_finite_number",

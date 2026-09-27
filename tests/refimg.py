@@ -13,6 +13,8 @@ PAGES_PER_BLOCK = 8
 PAGE_SIZE = 32
 LOGICAL_PAGES = 24
 MAGIC = 0xA5
+SNAP_MAGIC = 0x5A
+TOMB_MAGIC = 0x5B
 UNMAPPED = 0xFF
 
 
@@ -76,3 +78,48 @@ def assert_matches_reference(case, ftl, dev):
             case.assertIsNone(got, f"lpn={lpn} 应为未映射（参考映像）")
         else:
             case.assertEqual(got, exp, f"lpn={lpn} 与参考映像不符")
+
+
+def parse_snapshots(dev):
+    """独立扫描设备，返回 {snap_id: {lpn: 32 字节页内容}}（仅有效快照）。
+
+    独立复现“快照创建记录 + 墓碑仲裁”：快照 ID 不复用，存在墓碑即删除。
+    不调用 ftl 核心代码，格式常量在此独立维护。
+    """
+    creates = {}  # sid -> (ppn, mapping)
+    tombs = set()
+    for b in range(BLOCKS):
+        if dev.is_bad_block(b):
+            continue
+        for p in range(PAGES_PER_BLOCK):
+            ppn = b * PAGES_PER_BLOCK + p
+            raw = dev.read_page(b, p)
+            if raw[0] == SNAP_MAGIC:
+                if (zlib.crc32(raw[:27]) & 0xFFFFFFFF) != int.from_bytes(
+                    raw[27:31], "little"
+                ) or raw[31] != UNMAPPED:
+                    continue
+                sid = int.from_bytes(raw[1:3], "little")
+                mapping = list(raw[3:27])
+                ok = ppn not in mapping and all(
+                    x == UNMAPPED or x < BLOCKS * PAGES_PER_BLOCK for x in mapping
+                ) and len(set(x for x in mapping if x != UNMAPPED)) == len(
+                    [x for x in mapping if x != UNMAPPED]
+                )
+                if ok and (sid not in creates or ppn > creates[sid][0]):
+                    creates[sid] = (ppn, mapping)
+            elif raw[0] == TOMB_MAGIC:
+                if (zlib.crc32(raw[:3]) & 0xFFFFFFFF) == int.from_bytes(
+                    raw[3:7], "little"
+                ) and all(x == UNMAPPED for x in raw[7:]):
+                    tombs.add(int.from_bytes(raw[1:3], "little"))
+    result = {}
+    for sid, (_, mapping) in creates.items():
+        if sid in tombs:
+            continue
+        image = {}
+        for lpn, dppn in enumerate(mapping):
+            if dppn != UNMAPPED:
+                image[lpn] = dev.read_page(dppn // PAGES_PER_BLOCK, dppn % PAGES_PER_BLOCK)
+        result[sid] = image
+    return result

@@ -74,6 +74,33 @@ def part_normal():
     print(f"  恢复后继续写并读回: {ftl2.read(7)[:9].decode()!r}")
     show_capacity("恢复后", ftl2)
 
+    print("  -- 只读快照：当前版本继续写，旧版本保持可读 --")
+    sdev = RawNand(max_erases=8)
+    sftl = FTL(sdev)
+    sftl.write(0, b"snapshot-v0")
+    snap_id = sftl.create_snapshot()
+    for i in range(1, 61):  # 大量覆盖写触发 GC
+        sftl.write(i % 6, b"v%03d" % i)
+    old = sftl.read_snapshot(snap_id, 0) == b"snapshot-v0".ljust(PAGE_SIZE, b"\xff")
+    cur = sftl.read(0) == b"v060".ljust(PAGE_SIZE, b"\xff")
+    print(f"  GC 后旧快照完好={old}，当前版本为最新数据={cur}")
+    sdev.set_crash_plan([1])
+    sdev.arm_crash()
+    try:
+        sftl.write(0, b"after-snap-crash")
+    except PowerLossError as e:
+        print(f"  快照路径注入掉电: {e}")
+    sdev.reboot()
+    sftl2 = FTL(sdev)
+    persist = (
+        sftl2.snapshots() == (snap_id,)
+        and sftl2.read_snapshot(snap_id, 0) == b"snapshot-v0".ljust(PAGE_SIZE, b"\xff")
+    )
+    print(f"  断电重启后已提交快照与当前映像均完整: {persist}")
+    sftl2.delete_snapshot(snap_id)
+    reclaimed = sftl2.gc_collect()
+    print(f"  删除快照后可回收块数={reclaimed}，现存快照={sftl2.snapshots()}")
+
 
 def part_boundary():
     print("=== 第二部分（实际触发的拒绝/异常边界）：磨损极限与非法输入 ===")
@@ -108,6 +135,27 @@ def part_boundary():
             print(f"  错误：{label} 应被拒绝")
         except InvalidInputError as e:
             print(f"  非法输入被拒绝 [{label}]: {e}")
+
+    print("  -- 快照占用导致空间不足时明确拒绝 --")
+    odev = RawNand(max_erases=1000)
+    oftl = FTL(odev)
+    for l in range(24):
+        oftl.write(l, b"gen0")
+    try:
+        for g in range(1, 64):
+            for l in range(24):
+                oftl.write(l, b"g%02d" % g)
+            oftl.create_snapshot()
+        print("  错误：应触发空间不足")
+    except OutOfSpaceError as e:
+        print(
+            f"  有效快照钉住全部历史数据，写被拒绝 OutOfSpaceError: {e}；"
+            f"仍有 {len(oftl.snapshots())} 个快照可读"
+        )
+    try:
+        oftl.read_snapshot(9000, 0)
+    except InvalidInputError as e:
+        print(f"  读取不存在的快照被拒绝: {e}")
 
 
 if __name__ == "__main__":
